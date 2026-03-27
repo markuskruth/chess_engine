@@ -20,15 +20,67 @@ class ChessEnv:
 
 
     def reset(self):
-        self.board.reset(self.start_fen)
-        return self.get_state()
+        self.board.set_fen(self.start_fen)
+        return self.board
 
 
-    # GET STATE (20 channel tensor)
-    def get_state(self):
+    # Decode state to board
+    @staticmethod
+    def decode_state(state):
+        # Initialize an empty board (no pieces)
+        board = chess.Board(None)
+        
+        # 1. Decode Pieces (Channels 0-11)
+        # 0-5: White P, N, B, R, Q, K | 6-11: Black P, N, B, R, Q, K
+        for channel in range(12):
+            piece_type = (channel % 6) + 1
+            color = chess.WHITE if channel < 6 else chess.BLACK
+            
+            # Find indices where piece exists (value == 1)
+            rows, cols = np.where(state[channel] == 1)
+            
+            for r, c in zip(rows, cols):
+                # Reverse: tensor_row = 7 - row  =>  row = 7 - tensor_row
+                row = 7 - r
+                col = c
+                square = chess.square(col, row)
+                board.set_piece_at(square, chess.Piece(piece_type, color))
+
+        # 2. Set Turn
+        # Since the agent always sees themselves as White, the decoded board 
+        # turn is always White.
+        board.turn = chess.WHITE
+
+        # 3. Castling Rights (Channels 13-16)
+        # We use bitwise OR to set rights using chess library bitboards
+        rights = 0
+        if np.any(state[13] == 1): rights |= chess.BB_H1 # White King-side
+        if np.any(state[14] == 1): rights |= chess.BB_A1 # White Queen-side
+        if np.any(state[15] == 1): rights |= chess.BB_H8 # Black King-side
+        if np.any(state[16] == 1): rights |= chess.BB_A8 # Black Queen-side
+        board.castling_rights = rights
+
+        # 4. En Passant Square (Channel 17)
+        ep_rows, ep_cols = np.where(state[17] == 1)
+        if len(ep_rows) > 0:
+            row = 7 - ep_rows[0]
+            col = ep_cols[0]
+            board.ep_square = chess.square(col, row)
+
+        # 5. Halfmove Clock (Channel 18)
+        # Multiply back by 50 and round to nearest int
+        board.halfmove_clock = int(np.round(state[18, 0, 0] * 50))
+
+        # Note: 3-fold repetition (Channel 19) cannot be fully "restored" 
+        # into a new Board object's move stack easily, but the board 
+        # state itself is now valid for move generation.
+
+        return board
+
+    # Encode state from board (20 channel tensor)
+    @staticmethod
+    def encode_state(board):
         state = np.zeros((20, 8, 8), dtype=np.float32)
-
-        board = self.board
         flip = (board.turn == chess.BLACK)
 
         piece_map = board.piece_map()
@@ -209,15 +261,49 @@ class ChessEnv:
 
     
     # LEGAL ACTION MASK
-    def get_action_mask(self):
+    @staticmethod
+    def get_action_mask(state):
         """Returns a boolean (8, 8, 73) mask of legal moves."""
+        board = ChessEnv.decode_state(state)
         mask = np.zeros((8, 8, 73), dtype=bool)
-        flip = (self.board.turn == chess.BLACK)
-        for move in self.board.legal_moves:
-            idx = self.move_to_index(move, flip)
-            if idx is not None:
-                r, c, t = np.unravel_index(idx, (8, 8, 73))
-                mask[r, c, t] = True
+
+        for move in board.legal_moves:
+            from_sq = move.from_square
+            to_sq = move.to_square
+            
+            from_row, from_col = chess.square_rank(from_sq), chess.square_file(from_sq)
+            to_row, to_col = chess.square_rank(to_sq), chess.square_file(to_sq)
+            
+            # Convert to your tensor coordinates (tensor_row = 7 - rank)
+            t_row, t_col = 7 - from_row, from_col
+            
+            dr, dc = to_row - from_row, to_col - from_col
+            plane = -1
+
+            # 1. Under-promotions (Planes 64-72)
+            # Queen promotions are handled as normal moves in planes 0-63
+            if move.promotion and move.promotion != chess.QUEEN:
+                # 3 directions: capture-left (-1), forward (0), capture-right (1)
+                promo_dir = dc + 1 
+                # 3 pieces: Knight (0), Bishop (1), Rook (2)
+                promo_piece = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}[move.promotion]
+                plane = 64 + (promo_dir * 3) + promo_piece
+
+            # 2. Knight Moves (Planes 56-63)
+            elif (dr, dc) in KNIGHT_MOVES:
+                plane = 56 + KNIGHT_MOVES.index((dr, dc))
+
+            # 3. Queen-like Moves (Planes 0-55)
+            else:
+                distance = max(abs(dr), abs(dc))
+                direction = (dr // distance, dc // distance)
+                if direction in DIRECTIONS:
+                    dir_idx = DIRECTIONS.index(direction)
+                    plane = (dir_idx * 7) + (distance - 1)
+
+            if plane != -1:
+                mask[t_row, t_col, plane] = True
+
         return mask
 
     # STEP FUNCTION
@@ -253,3 +339,7 @@ class ChessEnv:
 
     def render(self):
         print(self.board)
+    
+    def get_state(self):
+        """Return encoded state from the current board."""
+        return ChessEnv.encode_state(self.board)
