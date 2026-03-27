@@ -7,6 +7,8 @@ from Agent import MCTS
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
 
+START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
+
 pygame.init()
 
 # Display
@@ -288,7 +290,7 @@ if __name__ == "__main__":
     # Initialize game and AI
     initialize_game()
     
-    board = chess.Board("8/2ppk3/8/8/8/8/PPP1K3/8 w - - 0 1")
+    board = chess.Board(START_FEN)
     
     clock = pygame.time.Clock()
     
