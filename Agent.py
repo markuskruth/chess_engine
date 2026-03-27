@@ -4,31 +4,25 @@ import torch.optim as optim
 import numpy as np
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
-from utils import ReplayBuffer
+from utils import ReplayBuffer, Node
 import chess
 
-NUM_SIMULATIONS = 100
-
-
-class Node:
-    def __init__(self, state):
-        self.state = state
-        self.P = None   # prior probabilities
-        self.N = np.zeros(4672)  # how many times each action has been picked
-        self.W = np.zeros(4672)  # cumulative value
-        self.Q = np.zeros(4672)  # current Q-value for each action
-        self.children = {}
-        self.is_expanded = False
-
-
 class MCTS:
-    def __init__(self, env: ChessEnv = None, buffer_size=100000):
+    def __init__(
+        self, 
+        env: ChessEnv = None, 
+        buffer_size=100000, 
+        batch_size=16,
+        num_simulations=100):
+
         self.env = env if env is not None else ChessEnv()
         self.c = 1.0
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CNNNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.memory = ReplayBuffer(capacity=buffer_size)
+        self.batch_size = batch_size
+        self.num_simulations = num_simulations
 
     def mask_illegal_moves(self, actions, state):
         """Mask illegal moves by setting their values to 0."""
@@ -144,7 +138,7 @@ class MCTS:
             move_count += 1
 
             # Run MCTS
-            for _ in range(NUM_SIMULATIONS):
+            for _ in range(self.num_simulations):
                 self.run_simulation(root)
 
             # Get policy
@@ -189,7 +183,7 @@ class MCTS:
     def train_network(self, num_batches=10):
         """Train the neural network on data from replay buffer."""
         for _ in range(num_batches):
-            batch = self.memory.sample(batch_size=32)
+            batch = self.memory.sample(batch_size=self.batch_size)
 
             states, target_pis, target_vs = batch
 
@@ -254,14 +248,16 @@ class MCTS:
             return 0
 
 
-if __name__ == "__main__":
+def run_training(
+    episodes,
+    num_games_per_episode,
+    batch_size,
+    num_simulations
+    ):
     print("Initializing MCTS Chess Training Engine...")
 
-    episodes = 10
-    num_games_per_episode = 50
-
     # Initialize MCTS agent
-    mcts = MCTS(buffer_size=100000)
+    mcts = MCTS(buffer_size=100000, batch_size=batch_size)
 
     print("Starting MCTS Self-Play Training Loop...")
 
@@ -302,3 +298,17 @@ if __name__ == "__main__":
     print("\n" + "="*50)
     print("Training complete!")
     print("="*50)
+
+
+if __name__ == "__main__":
+    episodes = 100
+    num_games_per_episode = 50
+    batch_size = 128
+    num_simulations = 200
+
+    run_training(
+        episodes=episodes,
+        num_games_per_episode=num_games_per_episode,
+        batch_size=batch_size,
+        num_simulations=num_simulations
+    )

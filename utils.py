@@ -1,5 +1,15 @@
 import numpy as np
 
+class Node:
+    def __init__(self, state):
+        self.state = state
+        self.P = None   # prior probabilities
+        self.N = np.zeros(4672)  # how many times each action has been picked
+        self.W = np.zeros(4672)  # cumulative value
+        self.Q = np.zeros(4672)  # current Q-value for each action (mean cum value)
+        self.children = {}
+        self.is_expanded = False
+
 class ReplayBuffer:
     def __init__(self, capacity, state_shape=(20, 8, 8), action_size=4672):
         self.capacity = capacity
