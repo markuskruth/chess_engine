@@ -4,8 +4,27 @@ import torch.optim as optim
 import numpy as np
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
-from utils import ReplayBuffer, Node
+from utils import ReplayBuffer
 import chess
+from collections import deque
+
+
+class Node:
+    """Optimized Node with memory efficiency."""
+    __slots__ = ['state', 'board', 'P', 'N', 'W', 'Q', 'children', 'is_expanded', 'total_N', 'legal_moves_cache']
+    
+    def __init__(self, state=None, board=None):
+        self.state = state
+        self.board = board  # Keep board to avoid encoding/decoding
+        self.P = None
+        self.N = np.zeros(4672, dtype=np.uint32)  # Use uint32 for memory efficiency
+        self.W = np.zeros(4672, dtype=np.float32)
+        self.Q = np.zeros(4672, dtype=np.float32)
+        self.children = {}
+        self.is_expanded = False
+        self.total_N = 0  # Cache total visits to avoid repeated summing
+        self.legal_moves_cache = None
+
 
 class MCTS:
     def __init__(
@@ -23,33 +42,65 @@ class MCTS:
         self.memory = ReplayBuffer(capacity=buffer_size)
         self.batch_size = batch_size
         self.num_simulations = num_simulations
+        
+        # Cache for action masks
+        self._action_mask_cache = {}
 
-    def mask_illegal_moves(self, actions, state):
-        """Mask illegal moves by setting their values to 0."""
-        action_mask = ChessEnv.get_action_mask(state)
-        # Flatten mask from (8, 8, 73) to (4672,)
+    def get_legal_moves_array(self, board):
+        """Get legal moves and convert to proper action indices."""
+        return list(board.legal_moves)
+
+    def mask_illegal_moves(self, actions, board=None, state=None):
+        """Mask illegal moves using the board directly (faster)."""
+        if board is not None:
+            action_mask = ChessEnv.get_action_mask(board=board)
+        else:
+            action_mask = ChessEnv.get_action_mask(state=state)
         action_mask = action_mask.reshape(-1)
         masked_actions = np.where(action_mask, actions, -np.inf)
         return masked_actions
 
-    def select(self, node):
-        """Selection phase: traverse tree using UCB until unexpanded node."""
+    def run_simulation(self, root):
+        """Optimized single MCTS simulation."""
+        node = root
+        path = []
+        board = root.board.copy()  # Copy board once for simulation
+
+        # Selection phase
         while node.is_expanded:
-            state = node.state
-            total_n = np.sum(node.N)
-
-            ucb = node.Q + self.c * node.P * (np.sqrt(total_n + 1) / (1 + node.N))
-
-            # Mask illegal moves
-            ucb = self.mask_illegal_moves(ucb, state)
+            ucb = node.Q + self.c * node.P * np.sqrt(node.total_N + 1) / (1 + node.N)
+            ucb = self.mask_illegal_moves(ucb, board=board)
 
             action = np.argmax(ucb)
+            path.append((node, action))
+
             if action not in node.children:
-                return node, action
+                # Create new child node
+                legal_moves = list(board.legal_moves)
+                if action < len(legal_moves):
+                    move = legal_moves[action]
+                    board.push(move)
+                    state = ChessEnv.encode_state(board)
+                    new_node = Node(state, board.copy())
+                    new_node.legal_moves_cache = self.get_legal_moves_array(board)
+                    node.children[action] = new_node
+                    node = new_node
+                break
+            else:
+                # Traverse existing child
+                legal_moves = list(board.legal_moves)
+                if action < len(legal_moves):
+                    board.push(legal_moves[action])
+                    node = node.children[action]
+                else:
+                    break
 
-            node = node.children[action]
+        # Expansion & Evaluation
+        value = self.expand(node)
 
-        return node, None
+        # Backpropagation
+        self.backpropagate(path, value)
+
 
     def expand(self, node):
         """Expansion phase: evaluate node with neural network."""
@@ -64,7 +115,7 @@ class MCTS:
         p = p.cpu().numpy().flatten()
         v = v.cpu().numpy().item()
 
-        p = self.mask_illegal_moves(p, state)
+        p = self.mask_illegal_moves(p, state=state)
         # Convert -inf back to 0 and normalize
         p = np.where(np.isinf(p), 0, p)
         p = np.exp(p) if np.max(p) > 0 else p  # Handle log probabilities
@@ -75,6 +126,7 @@ class MCTS:
 
         return v
 
+
     def backpropagate(self, path, value):
         """Backpropagation phase: update statistics along the path."""
         for node, action in reversed(path):
@@ -84,55 +136,16 @@ class MCTS:
 
             value = -value  # switch perspective
 
-    def run_simulation(self, root):
-        """Run a single MCTS simulation."""
-        node = root
-        path = []
-
-        # Selection phase
-        while node.is_expanded:
-            total_N = np.sum(node.N)
-            ucb = node.Q + self.c * node.P * np.sqrt(total_N + 1) / (1 + node.N)
-            ucb = self.mask_illegal_moves(ucb, node.state)
-
-            action = np.argmax(ucb)
-            path.append((node, action))
-
-            if action not in node.children:
-                next_state = self.step_environment(node.state, action)
-                node.children[action] = Node(next_state)
-                node = node.children[action]
-                break
-
-            node = node.children[action]
-
-        # Expansion & Evaluation
-        value = self.expand(node)
-
-        # Backpropagation
-        self.backpropagate(path, value)
-
-    def get_policy(self, root, temperature=1.0):
-        """Get policy distribution from visit counts."""
-        N = root.N.copy().astype(np.float32)
-
-        if temperature == 0:
-            pi = np.zeros_like(N)
-            pi[np.argmax(N)] = 1
-            return pi
-
-        N = N ** (1 / temperature)
-        return N / (np.sum(N) + 1e-10)
 
     def play_game(self):
-        """Play a complete game of self-play."""
+        """Optimized game play - keep board object alive."""
         memory = []
         board = self.env.reset()
         state = ChessEnv.encode_state(board)
 
-        root = Node(state)
+        root = Node(state, board.copy())
         move_count = 0
-        max_moves = 500  # Prevent infinite games
+        max_moves = 500
 
         while not board.is_game_over() and move_count < max_moves:
             move_count += 1
@@ -142,110 +155,77 @@ class MCTS:
                 self.run_simulation(root)
 
             # Get policy
-            pi = self.get_policy(root, temperature=1.0)
+            N = root.N.copy().astype(np.float32)
+            pi = N ** (1.0) 
+            pi = pi / (np.sum(pi) + 1e-10)
 
-            # Store state and policy
-            memory.append((state.copy(), pi.copy()))
+            # Store state and policy (avoid .copy() when possible for speed)
+            memory.append((state, pi))
 
             # Sample a move
             action = np.random.choice(len(pi), p=pi)
 
-            # Step environment
-            move = self.action_to_move(board, action)
-            if move is None or move not in board.legal_moves:
+            # Execute move
+            legal_moves = list(board.legal_moves)
+            if action >= len(legal_moves):
                 break
 
+            move = legal_moves[action]
             board.push(move)
             state = ChessEnv.encode_state(board)
 
-            # Reuse tree to speed up
+            # Reuse tree
             if action in root.children:
                 root = root.children[action]
+                root.board = board.copy()  # Update board reference
             else:
-                root = Node(state)
+                root = Node(state, board.copy())
 
-        # Game ended so assign rewards
-        z = self.get_game_result(board)  # +1 / -1 / 0
+        # Assign rewards
+        z = self.get_game_result(board)
 
-        # Assign reward to each step
         data = []
         for i, (s, pi) in enumerate(memory):
-            # Alternate perspective
-            if i % 2 == 0:
-                value = z
-            else:
-                value = -z
-
+            value = z if (i % 2 == 0) else -z
             data.append((s, pi, value))
 
         return data
 
-    def train_network(self, num_batches=10):
-        """Train the neural network on data from replay buffer."""
+    def train_network(self, num_batches=50):
+        """Optimized training with larger batch size."""
+        if len(self.memory) < self.batch_size:
+            return
+            
         for _ in range(num_batches):
             batch = self.memory.sample(batch_size=self.batch_size)
-
             states, target_pis, target_vs = batch
 
-            # Convert to tensors
+            # Batch tensor conversion
             states_tensor = torch.FloatTensor(states).to(self.device)
             target_pis_tensor = torch.FloatTensor(target_pis).to(self.device)
             target_vs_tensor = torch.FloatTensor(target_vs).to(self.device)
 
             # Forward pass
             pred_p, pred_v = self.model(states_tensor)
-
-            # Flatten policy output from (batch, 8, 8, 73) to (batch, 4672)
             pred_p = pred_p.view(pred_p.size(0), -1)
 
-            # Compute loss
+            # Combined loss
             value_loss = nn.MSELoss()(pred_v, target_vs_tensor)
-
-            # Policy loss (cross-entropy)
             log_probs = torch.log_softmax(pred_p, dim=1)
             policy_loss = -(target_pis_tensor * log_probs).sum(dim=1).mean()
-
+            
             loss = value_loss + policy_loss
 
-            # Backpropagation
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
-    def step_environment(self, state, action):
-        """Execute action in environment and return new state."""
-        board = ChessEnv.decode_state(state)
-        move = self.action_to_move(board, action)
-
-        if move is None or move not in board.legal_moves:
-            return state
-
-        board.push(move)
-        return ChessEnv.encode_state(board)
-
-    def action_to_move(self, board, action):
-        """Convert action index to chess move."""
-        legal_moves = list(board.legal_moves)
-
-        if action < len(legal_moves):
-            return legal_moves[action]
-
-        if legal_moves:
-            return legal_moves[0]
-        return None
-
     def get_game_result(self, board):
-        """Get result of game: 1 for white win, -1 for black win, 0 for draw."""
+        """Get result of game."""
         if not board.is_game_over():
             return 0
-
         result = board.result()
-        if result == "1-0":
-            return 1
-        elif result == "0-1":
-            return -1
-        else:
-            return 0
+        return 1 if result == "1-0" else (-1 if result == "0-1" else 0)
 
 
 def run_training(
@@ -254,57 +234,48 @@ def run_training(
     batch_size,
     num_simulations
     ):
+    """Optimized training loop."""
     print("Initializing MCTS Chess Training Engine...")
-
-    # Initialize MCTS agent
-    mcts = MCTS(buffer_size=100000, batch_size=batch_size)
-
-    print("Starting MCTS Self-Play Training Loop...")
+    mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
+    
+    print(f"Device: {mcts.device}")
+    print(f"Running {episodes} episodes with {num_games_per_episode} games per episode")
+    print(f"Simulations per position: {num_simulations}")
+    print(f"Batch size: {batch_size}\n")
 
     for ep in range(episodes):
-        print(f"\n{'='*50}")
         print(f"Episode {ep+1}/{episodes}")
-        print(f"{'='*50}")
 
         # 1. SELF-PLAY
-        print(f"Playing {num_games_per_episode} games...")
-        games_data = []
-
         for game_idx in range(num_games_per_episode):
             game_data = mcts.play_game()
-            games_data.extend(game_data)
-            if (game_idx + 1) % 10 == 0:
-                print(f"  Completed {game_idx + 1}/{num_games_per_episode} games")
-
-        # Add all game data to replay buffer
-        for state, policy, value in games_data:
-            mcts.memory.add(state, policy, np.array([value]))
-
-        print(f"Replay buffer size: {len(mcts.memory)}")
+            for state, policy, value in game_data:
+                mcts.memory.add(state, policy, np.array([value]))
+            
+            if (game_idx + 1) % 25 == 0:
+                print(f"  Games: {game_idx + 1}/{num_games_per_episode} | Buffer: {len(mcts.memory)}")
 
         # 2. TRAIN NETWORK
-        if len(mcts.memory) > 32:
-            print("Training network...")
-            mcts.train_network(num_batches=20)
-            print("Training complete")
-        else:
-            print(f"Not enough data in replay buffer (need 32, have {len(mcts.memory)})")
-
-        # 3. Save model checkpoint
+        if len(mcts.memory) > batch_size:
+            print(f"  Training... ", end="", flush=True)
+            mcts.train_network(num_batches=50)
+            print("done")
+        
+        # 3. Save checkpoint
         if (ep + 1) % 5 == 0:
             torch.save(mcts.model.state_dict(), f"model_checkpoint_ep{ep+1}.pt")
-            print(f"Model saved: model_checkpoint_ep{ep+1}.pt")
+            print(f"  Saved: model_checkpoint_ep{ep+1}.pt\n")
 
     print("\n" + "="*50)
-    print("Training complete!")
+    print("Training Complete!")
     print("="*50)
 
 
 if __name__ == "__main__":
-    episodes = 100
-    num_games_per_episode = 50
-    batch_size = 128
-    num_simulations = 200
+    episodes = 50
+    num_games_per_episode = 10
+    batch_size = 32
+    num_simulations = 100
 
     run_training(
         episodes=episodes,

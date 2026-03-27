@@ -13,14 +13,16 @@ KNIGHT_MOVES = [
 
 PROMOTIONS = [chess.ROOK, chess.BISHOP, chess.KNIGHT]
 
+START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
+
 class ChessEnv:
     def __init__(self):
         self.start_fen = "8/2ppk3/8/8/8/8/PPP1K3/8 w - - 0 1"
-        self.board = chess.Board(self.start_fen)
+        self.board = chess.Board(START_FEN)
 
 
     def reset(self):
-        self.board.set_fen(self.start_fen)
+        self.board.set_fen(START_FEN)
         return self.board
 
 
@@ -262,9 +264,11 @@ class ChessEnv:
     
     # LEGAL ACTION MASK
     @staticmethod
-    def get_action_mask(state):
+    def get_action_mask(state=None, board=None):
         """Returns a boolean (8, 8, 73) mask of legal moves."""
-        board = ChessEnv.decode_state(state)
+        if state is not None:
+            board = ChessEnv.decode_state(state)
+
         mask = np.zeros((8, 8, 73), dtype=bool)
 
         for move in board.legal_moves:
