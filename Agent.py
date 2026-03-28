@@ -137,7 +137,7 @@ class MCTS:
             value = -value  # switch perspective
 
 
-    def play_game(self):
+    def play_game(self, temperature=1.0):
         """Optimized game play - keep board object alive."""
         memory = []
         board = self.env.reset()
@@ -145,7 +145,7 @@ class MCTS:
 
         root = Node(state, board.copy())
         move_count = 0
-        max_moves = 500
+        max_moves = 300
 
         while not board.is_game_over() and move_count < max_moves:
             move_count += 1
@@ -156,29 +156,24 @@ class MCTS:
 
             # Get policy
             N = root.N.copy().astype(np.float32)
-            pi = N ** (1.0) 
+            pi = N ** temperature
             pi = pi / (np.sum(pi) + 1e-10)
 
-            # Store state and policy (avoid .copy() when possible for speed)
+            # Store state and policy
             memory.append((state, pi))
 
             # Sample a move
-            action = np.random.choice(len(pi), p=pi)
+            action_idx = np.random.choice(len(pi), p=pi)
 
             # Execute move
-            legal_moves = list(board.legal_moves)
-            if action >= len(legal_moves):
-                break
-
-            move = legal_moves[action]
-            board.push(move)
-            state = ChessEnv.encode_state(board)
+            ChessEnv.apply_action(action_idx, board)
 
             # Reuse tree
-            if action in root.children:
+            if action_idx in root.children:
                 root = root.children[action]
                 root.board = board.copy()  # Update board reference
             else:
+                state = ChessEnv.encode_state(board)
                 root = Node(state, board.copy())
 
         # Assign rewards
@@ -234,7 +229,7 @@ def run_training(
     batch_size,
     num_simulations
     ):
-    """Optimized training loop."""
+    """training loop."""
     print("Initializing MCTS Chess Training Engine...")
     mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
     
@@ -274,8 +269,8 @@ def run_training(
 if __name__ == "__main__":
     episodes = 50
     num_games_per_episode = 10
-    batch_size = 32
-    num_simulations = 100
+    batch_size = 64
+    num_simulations = 200
 
     run_training(
         episodes=episodes,

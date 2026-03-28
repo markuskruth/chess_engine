@@ -152,19 +152,17 @@ class ChessEnv:
 
         return state
     
-
-    def apply_action(self, action):
+    @staticmethod
+    def apply_action(action_idx, board):
         """
         action: (8, 8, 73) policy output
         """
 
-        board = self.board
         mover = board.turn
         flip = (mover == chess.BLACK)
 
         # 1. Select action by taking argmax of the logits
-        idx = np.argmax(action)
-        row, col, move_type = np.unravel_index(idx, (8, 8, 73))
+        row, col, move_type = np.unravel_index(action_idx, (8, 8, 73))
 
         # Convert FROM square to real board coords
         real_row = 7 - row if flip else row
@@ -252,7 +250,7 @@ class ChessEnv:
         # 3. Validate move
         if move in board.legal_moves:
             board.push(move)
-            return True, mover
+            return True, move
         else:
             return False, mover
 

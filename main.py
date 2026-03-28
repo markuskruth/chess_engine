@@ -3,11 +3,13 @@ import sys
 import chess
 import torch
 import numpy as np
-from Agent import MCTS
+from Agent import MCTS, Node
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
 
 START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
+LATEST_MODEL = "model_checkpoint_ep20.pt"
+NUM_SIMULATIONS = 2000
 
 pygame.init()
 
@@ -66,11 +68,10 @@ def initialize_game():
         import os
         model_files = [f for f in os.listdir('.') if f.startswith('model_checkpoint')]
         if model_files:
-            latest_model = sorted(model_files)[-1]
-            print(f"Loading trained model: {latest_model}")
-            ai_agent.model.load_state_dict(torch.load(latest_model, map_location=ai_agent.device))
+            ai_agent.model.load_state_dict(torch.load(LATEST_MODEL, map_location=ai_agent.device))
             ai_agent.model.eval()
-            message = f"Loaded {latest_model}"
+            print(f"Loaded {LATEST_MODEL}")
+            message = f"Loaded {LATEST_MODEL}"
         else:
             print("No trained model found. Using untrained model.")
             message = "Using untrained model"
@@ -96,8 +97,8 @@ def draw_menu():
     pygame.display.update()
 
 
-def ai_make_move(board):
-    """Use AI to select and make a move."""
+def ai_make_move(board, temperature=1.0):
+    """Use AI to select and make a move with MCTS. Model acts as a guide in UCB computation."""
     global message
     
     try:
@@ -105,30 +106,25 @@ def ai_make_move(board):
         if not legal_moves:
             return
         
-        # Run fewer simulations for faster gameplay
-        NUM_SIMULATIONS = 20
+        # Create root node for MCTS tree
         state = ChessEnv.encode_state(board)
-        root = ai_agent.memory.__class__.__bases__[0].__dict__.get('Node')
+        root = Node(state, board.copy())
         
-        # Simplified AI: use the model's policy output to select move
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(ai_agent.device)
-        with torch.no_grad():
-            p, v = ai_agent.model(state_tensor)
+        # Run MCTS simulations
+        for _ in range(NUM_SIMULATIONS):
+            ai_agent.run_simulation(root)
         
-        # Flatten and mask illegal moves
-        p = p.cpu().numpy().flatten()
-        action_mask = ChessEnv.get_action_mask(state).reshape(-1)
-        p = np.where(action_mask, p, -np.inf)
+        # Get policy
+        N = root.N.copy().astype(np.float32)
+        pi = N ** temperature
+        pi = pi / (np.sum(pi) + 1e-10)
         
-        # Select best legal move
-        if np.any(np.isfinite(p)):
-            action = np.argmax(p)
-            move = legal_moves[min(action % len(legal_moves), len(legal_moves) - 1)]
-        else:
-            # Fallback: random legal move
-            move = legal_moves[np.random.randint(len(legal_moves))]
+        # Select action with highest visit count
+        action_idx = np.argmax(pi)
         
-        board.push(move)
+        # Execute move
+        valid, move = ChessEnv.apply_action(action_idx, board)
+
         color_name = "White" if board.turn == chess.BLACK else "Black"
         message = f"AI ({color_name}) played: {move.uci()}"
         
