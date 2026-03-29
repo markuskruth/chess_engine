@@ -17,13 +17,64 @@ START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
 
 class ChessEnv:
     def __init__(self):
-        self.start_fen = "8/2ppk3/8/8/8/8/PPP1K3/8 w - - 0 1"
         self.board = chess.Board(START_FEN)
 
 
-    def reset(self):
-        self.board.set_fen(START_FEN)
-        return self.board
+    @staticmethod
+    def reset():
+        return chess.Board(START_FEN)
+    
+
+    @staticmethod
+    def get_potential(board):
+        """
+        Calculates the potential Phi(s) of a board state in centipawns (cp),
+        then normalizes it to [-1, 1] using a sigmoid function.
+        """
+        if board.is_game_over():
+            # Terminal states use the actual outcome reward
+            return 0 
+
+        # 1. Material Weights [cite: 126]
+        weights = {
+            chess.PAWN: 100,
+            chess.KNIGHT: 325,
+            chess.BISHOP: 325,
+            chess.ROOK: 500,
+            chess.QUEEN: 950,
+            chess.KING: 0
+        }
+        
+        cp_score = 0
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece:
+                val = weights[piece.piece_type]
+                cp_score += val if piece.color == board.turn else -val
+
+        # 2. Activity: +10cp per legal move [cite: 127]
+        cp_score += 10 * board.legal_moves.count()
+
+        # 3. Center Control: +20cp for d4, d5, e4, e5 [cite: 129]
+        center_squares = [chess.D4, chess.D5, chess.E4, chess.E5]
+        for sq in center_squares:
+            piece = board.piece_at(sq)
+            if piece and piece.color == board.turn:
+                cp_score += 20
+
+        # 4. King Safety: -50cp for open files near castled king [cite: 128]
+        # (Simplified: check if files adjacent to king have no pawns)
+        king_sq = board.king(board.turn)
+        if king_sq:
+            file_idx = chess.square_file(king_sq)
+            for f in range(max(0, file_idx-1), min(8, file_idx+2)):
+                if not board.pieces(chess.PAWN, board.turn) & chess.BB_FILES[f]:
+                    cp_score -= 50
+
+        # 5. Normalization: Map CP to [-1, 1] range [cite: 120, 121]
+        # formula: 2 / (1 + 10^(-cp/400)) - 1
+        win_prob = 2 / (1 + 10**(-cp_score / 400)) - 1
+        return win_prob
 
 
     # Decode state to board
@@ -325,17 +376,18 @@ class ChessEnv:
 
 
     # REWARD FUNCTION
-    def get_reward(self):
-        if not self.board.is_game_over():
+    @staticmethod
+    def get_reward(board):
+        if not board.is_game_over():
             return 0
 
-        result = self.board.result()
+        result = board.result()
 
-        just_moved = not self.board.turn
+        just_moved = not board.turn
         if result == "1-0":
-            return 1 if just_moved == chess.WHITE else -1
+            return 10 if just_moved == chess.WHITE else -10
         elif result == "0-1":
-            return 1 if just_moved == chess.BLACK else -1
+            return 10 if just_moved == chess.BLACK else -10
         else:
             return 0
 

@@ -46,6 +46,10 @@ class MCTS:
         # Cache for action masks
         self._action_mask_cache = {}
 
+        # Reward params
+        self.gamma = 0.99  # Discount factor
+        self.lambd = 0.5   # Shaping weight (anneal this to 0 over time)
+
     def get_legal_moves_array(self, board):
         """Get legal moves and convert to proper action indices."""
         return list(board.legal_moves)
@@ -138,51 +142,62 @@ class MCTS:
 
 
     def play_game(self, temperature=1.0):
-        """Optimized game play - keep board object alive."""
         memory = []
-        board = self.env.reset()
+        board = ChessEnv.reset()
         state = ChessEnv.encode_state(board)
-
+        
         root = Node(state, board.copy())
+        
         move_count = 0
         max_moves = 300
+        trajectory = [] # Store (state, potential)
 
         while not board.is_game_over() and move_count < max_moves:
-            move_count += 1
-
-            # Run MCTS
+            phi_s = ChessEnv.get_potential(board) # Current state potential
+            state = ChessEnv.encode_state(board)
+            
+            # Run MCTS simulations
             for _ in range(self.num_simulations):
                 self.run_simulation(root)
 
-            # Get policy
+            # Get policy and choose move
             N = root.N.copy().astype(np.float32)
-            pi = N ** temperature
-            pi = pi / (np.sum(pi) + 1e-10)
-
-            # Store state and policy
-            memory.append((state, pi))
-
-            # Sample a move
+            pi = N / (np.sum(N) + 1e-10)
             action_idx = np.random.choice(len(pi), p=pi)
+
+            # Record state before move
+            trajectory.append({
+                "state": state,
+                "pi": pi,
+                "phi": phi_s,
+                "turn": board.turn
+            })
 
             # Execute move
             ChessEnv.apply_action(action_idx, board)
+            move_count += 1
 
-            # Reuse tree
-            if action_idx in root.children:
-                root = root.children[action]
-                root.board = board.copy()  # Update board reference
-            else:
-                state = ChessEnv.encode_state(board)
-                root = Node(state, board.copy())
-
-        # Assign rewards
-        z = self.get_game_result(board)
-
+        # Calculate final outcome reward Z
+        z = ChessEnv.get_reward(board)
+        #z = self.get_game_result(board)
+        
+        # BACKFILL SHAPED REWARDS
+        # The target value for training is the cumulative shaped return
         data = []
-        for i, (s, pi) in enumerate(memory):
-            value = z if (i % 2 == 0) else -z
-            data.append((s, pi, value))
+        for i in range(len(trajectory)):
+            # Terminal reward is only added to the very last move
+            r_terminal = z if (i == len(trajectory) - 1) else 0
+            
+            # PBRS Formula: F = gamma * Phi(s_next) - Phi(s_current)
+            phi_curr = trajectory[i]["phi"]
+            phi_next = trajectory[i+1]["phi"] if i+1 < len(trajectory) else 0
+            
+            shaping_term = (self.gamma * phi_next) - phi_curr
+            shaped_reward = r_terminal + (self.lambd * shaping_term)
+            
+            # The network predicts the value from the current player's perspective
+            # Flip sign if it's the opponent's turn relative to the game ender
+            data.append((trajectory[i]["state"], trajectory[i]["pi"], shaped_reward))
 
         return data
 
@@ -220,7 +235,7 @@ class MCTS:
         if not board.is_game_over():
             return 0
         result = board.result()
-        return 1 if result == "1-0" else (-1 if result == "0-1" else 0)
+        return 10 if result == "1-0" else (-10 if result == "0-1" else 0)
 
 
 def run_training(
