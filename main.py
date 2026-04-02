@@ -4,12 +4,13 @@ import chess
 import torch
 import numpy as np
 from Agent import MCTS, Node
+from MCTS_simple import MCTS_simple
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
 
 START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
 LATEST_MODEL = "model_checkpoint_ep20.pt"
-NUM_SIMULATIONS = 2000
+NUM_SIMULATIONS = 10000
 
 pygame.init()
 
@@ -43,7 +44,9 @@ for key in pieces:
 
 # Global variables
 ai_agent = None
+mcts_simple_agent = None
 human_color = chess.WHITE
+ai_type = None  # 'neural' or 'simple'
 game_over = False
 message = ""
 last_move = None
@@ -58,32 +61,59 @@ def get_square_from_mouse(pos):
 
 
 def initialize_game():
-    """Show menu to select player color and initialize AI."""
-    global human_color, ai_agent, game_over, message
+    """Initialize the selected AI type."""
+    global human_color, ai_agent, mcts_simple_agent, game_over, message, ai_type
     
-    print("Initializing AI agent...")
-    try:
-        ai_agent = MCTS(buffer_size=100000)
-        # Try to load a trained model if it exists
-        import os
-        model_files = [f for f in os.listdir('.') if f.startswith('model_checkpoint')]
-        if model_files:
-            ai_agent.model.load_state_dict(torch.load(LATEST_MODEL, map_location=ai_agent.device))
-            ai_agent.model.eval()
-            print(f"Loaded {LATEST_MODEL}")
-            message = f"Loaded {LATEST_MODEL}"
-        else:
-            print("No trained model found. Using untrained model.")
-            message = "Using untrained model"
-    except Exception as e:
-        print(f"Error initializing AI: {e}")
-        message = f"Error loading model: {e}"
-        return
+    if ai_type == 'neural':
+        print("Initializing Neural AI agent...")
+        try:
+            ai_agent = MCTS(buffer_size=100000)
+            # Try to load a trained model if it exists
+            import os
+            model_files = [f for f in os.listdir('.') if f.startswith('model_checkpoint')]
+            if model_files:
+                ai_agent.model.load_state_dict(torch.load(LATEST_MODEL, map_location=ai_agent.device))
+                ai_agent.model.eval()
+                print(f"Loaded {LATEST_MODEL}")
+                message = f"AI Type: Neural MCTS | Loaded {LATEST_MODEL}"
+            else:
+                print("No trained model found. Using untrained model.")
+                message = "AI Type: Neural MCTS | Using untrained model"
+        except Exception as e:
+            print(f"Error initializing Neural AI: {e}")
+            message = f"Error loading model: {e}"
+            return
+    elif ai_type == 'simple':
+        print("Initializing Simple MCTS agent...")
+        try:
+            mcts_simple_agent = MCTS_simple(num_simulations=NUM_SIMULATIONS)
+            message = f"AI Type: Simple MCTS | Simulations: {NUM_SIMULATIONS}"
+            print(f"Initialized Simple MCTS with {NUM_SIMULATIONS} simulations")
+        except Exception as e:
+            print(f"Error initializing Simple MCTS: {e}")
+            message = f"Error initializing Simple MCTS: {e}"
+            return
     
     game_over = False
 
 
-def draw_menu():
+def draw_ai_type_menu():
+    """Draw AI type selection menu."""
+    font_title = pygame.font.Font(None, 48)
+    font_text = pygame.font.Font(None, 36)
+    
+    title = font_title.render("Choose AI Type", True, (0, 0, 0))
+    neural_text = font_text.render("Press N for Neural MCTS (with AI)", True, (100, 100, 200))
+    simple_text = font_text.render("Press S for Simple MCTS (no AI)", True, (100, 100, 200))
+    
+    win.fill((240, 217, 181))
+    win.blit(title, (display_size // 2 - title.get_width() // 2, 100))
+    win.blit(neural_text, (display_size // 2 - neural_text.get_width() // 2, 250))
+    win.blit(simple_text, (display_size // 2 - simple_text.get_width() // 2, 350))
+    pygame.display.update()
+
+
+def draw_color_menu():
     """Draw color selection menu."""
     font = pygame.font.Font(None, 36)
     title = font.render("Choose Your Color", True, (0, 0, 0))
@@ -97,8 +127,8 @@ def draw_menu():
     pygame.display.update()
 
 
-def ai_make_move(board, temperature=1.0):
-    """Use AI to select and make a move with MCTS. Model acts as a guide in UCB computation."""
+def ai_make_move_neural(board, temperature=1.0):
+    """Use Neural MCTS to select and make a move. Model acts as a guide in UCB computation."""
     global message
     
     try:
@@ -126,15 +156,54 @@ def ai_make_move(board, temperature=1.0):
         valid, move = ChessEnv.apply_action(action_idx, board)
 
         color_name = "White" if board.turn == chess.BLACK else "Black"
-        message = f"AI ({color_name}) played: {move.uci()}"
+        message = f"Neural AI ({color_name}) played: {move.uci()}"
         
     except Exception as e:
-        print(f"Error in AI move: {e}")
-        message = f"AI Error: {e}"
+        print(f"Error in Neural AI move: {e}")
+        message = f"Neural AI Error: {e}"
         # Fallback: make random legal move
         legal_moves = list(board.legal_moves)
         if legal_moves:
             board.push(legal_moves[0])
+
+
+def ai_make_move_simple(board):
+    """Use Simple MCTS to select and make a move (no neural network)."""
+    global message
+    
+    try:
+        legal_moves = list(board.legal_moves)
+        if not legal_moves:
+            return
+        
+        # Get best move using Simple MCTS
+        move = mcts_simple_agent.best_move(board)
+        
+        if move and move in board.legal_moves:
+            board.push(move)
+            color_name = "White" if board.turn == chess.BLACK else "Black"
+            message = f"Simple MCTS ({color_name}) played: {move.uci()}"
+        else:
+            # Fallback: make random legal move
+            move = legal_moves[0]
+            board.push(move)
+            message = f"Simple MCTS played random move: {move.uci()}"
+        
+    except Exception as e:
+        print(f"Error in Simple MCTS move: {e}")
+        message = f"Simple MCTS Error: {e}"
+        # Fallback: make random legal move
+        legal_moves = list(board.legal_moves)
+        if legal_moves:
+            board.push(legal_moves[0])
+
+
+def ai_make_move(board, temperature=1.0):
+    """Wrapper function that calls appropriate AI based on ai_type."""
+    if ai_type == 'neural':
+        ai_make_move_neural(board, temperature)
+    elif ai_type == 'simple':
+        ai_make_move_simple(board)
 
 
 def get_game_status(board):
@@ -266,10 +335,27 @@ def handle_move(board):
 
 # MAIN LOOP
 if __name__ == "__main__":
+    # AI Type selection
+    ai_type_selected = False
+    while not ai_type_selected:
+        draw_ai_type_menu()
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_n:
+                    ai_type = 'neural'
+                    ai_type_selected = True
+                elif event.key == pygame.K_s:
+                    ai_type = 'simple'
+                    ai_type_selected = True
+    
     # Color selection
     color_selected = False
     while not color_selected:
-        draw_menu()
+        draw_color_menu()
         
         for event in pygame.event.get():
             if event.type == pygame.QUIT:

@@ -64,6 +64,8 @@ class MCTS:
         masked_actions = np.where(action_mask, actions, -np.inf)
         return masked_actions
 
+
+
     def run_simulation(self, root):
         """Optimized single MCTS simulation."""
         node = root
@@ -149,7 +151,7 @@ class MCTS:
         root = Node(state, board.copy())
         
         move_count = 0
-        max_moves = 300
+        max_moves = 200
         trajectory = [] # Store (state, potential)
 
         while not board.is_game_over() and move_count < max_moves:
@@ -202,10 +204,6 @@ class MCTS:
         return data
 
     def train_network(self, num_batches=50):
-        """Optimized training with larger batch size."""
-        if len(self.memory) < self.batch_size:
-            return
-            
         for _ in range(num_batches):
             batch = self.memory.sample(batch_size=self.batch_size)
             states, target_pis, target_vs = batch

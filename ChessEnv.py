@@ -16,9 +16,6 @@ PROMOTIONS = [chess.ROOK, chess.BISHOP, chess.KNIGHT]
 START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
 
 class ChessEnv:
-    def __init__(self):
-        self.board = chess.Board(START_FEN)
-
 
     @staticmethod
     def reset():
@@ -33,9 +30,9 @@ class ChessEnv:
         """
         if board.is_game_over():
             # Terminal states use the actual outcome reward
-            return 0 
+            return ChessEnv.get_reward(board)
 
-        # 1. Material Weights [cite: 126]
+        # 1. Material Weights
         weights = {
             chess.PAWN: 100,
             chess.KNIGHT: 325,
@@ -46,32 +43,41 @@ class ChessEnv:
         }
         
         cp_score = 0
+        # Material & Center
+        center_squares = [chess.D4, chess.D5, chess.E4, chess.E5]
         for square in chess.SQUARES:
             piece = board.piece_at(square)
             if piece:
                 val = weights[piece.piece_type]
-                cp_score += val if piece.color == board.turn else -val
+                # White pieces are positive, Black pieces are negative
+                if piece.color == chess.WHITE:
+                    cp_score += val
+                    if square in center_squares:
+                        cp_score += 20
+                else:
+                    cp_score -= val
+                    if square in center_squares:
+                        cp_score -= 20
 
-        # 2. Activity: +10cp per legal move [cite: 127]
-        cp_score += 10 * board.legal_moves.count()
+        # 2. Activity: +10cp per legal move
+        activity_score = 10 * board.legal_moves.count()
+        cp_score += activity_score if board.turn == chess.WHITE else -activity_score
 
-        # 3. Center Control: +20cp for d4, d5, e4, e5 [cite: 129]
-        center_squares = [chess.D4, chess.D5, chess.E4, chess.E5]
-        for sq in center_squares:
-            piece = board.piece_at(sq)
-            if piece and piece.color == board.turn:
-                cp_score += 20
+        # 4. King Safety: -50cp for open files near castled king
+        def get_king_safety(board, color):
+            safety_penalty = 0
+            king_sq = board.king(color)
+            if king_sq:
+                file_idx = chess.square_file(king_sq)
+                for f in range(max(0, file_idx-1), min(8, file_idx+2)):
+                    if not board.pieces(chess.PAWN, color) & chess.BB_FILES[f]:
+                        safety_penalty -= 50
+            return safety_penalty
+            
+        cp_score += get_king_safety(board, chess.WHITE)
+        cp_score -= get_king_safety(board, chess.BLACK)
 
-        # 4. King Safety: -50cp for open files near castled king [cite: 128]
-        # (Simplified: check if files adjacent to king have no pawns)
-        king_sq = board.king(board.turn)
-        if king_sq:
-            file_idx = chess.square_file(king_sq)
-            for f in range(max(0, file_idx-1), min(8, file_idx+2)):
-                if not board.pieces(chess.PAWN, board.turn) & chess.BB_FILES[f]:
-                    cp_score -= 50
-
-        # 5. Normalization: Map CP to [-1, 1] range [cite: 120, 121]
+        # 5. Normalization: Map CP to [-1, 1] range
         # formula: 2 / (1 + 10^(-cp/400)) - 1
         win_prob = 2 / (1 + 10**(-cp_score / 400)) - 1
         return win_prob
@@ -307,6 +313,7 @@ class ChessEnv:
 
 
     # LEGAL ACTIONS
+    @staticmethod
     def get_legal_actions(self):
         return list(self.board.legal_moves)
 
@@ -360,19 +367,20 @@ class ChessEnv:
         return mask
 
     # STEP FUNCTION
-    def step(self, action):
+    @staticmethod
+    def step(board, action_idx):
         """
         action: (8x8x73)
         """
 
-        valid_action = self.apply_action(action)
+        valid_action = ChessEnv.apply_action(action_idx, board)
         if not valid_action:
             raise ValueError("Illegal move")
 
-        done = self.board.is_game_over()
-        reward = self.get_reward()
+        done = board.is_game_over()
+        reward = ChessEnv.get_reward()
 
-        return self.get_state(), reward, done, {}
+        return ChessEnv.get_state(), reward, done, {}
 
 
     # REWARD FUNCTION
