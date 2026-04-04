@@ -13,7 +13,8 @@ KNIGHT_MOVES = [
 
 PROMOTIONS = [chess.ROOK, chess.BISHOP, chess.KNIGHT]
 
-START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
+#START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
+START_FEN = "r5k1/p2q2pn/2p1rp2/1p1pPN1P/2nP4/P1PQ1R2/6P1/1RB3K1 w - - 0 24"
 
 class ChessEnv:
 

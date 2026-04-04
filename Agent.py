@@ -8,6 +8,8 @@ from utils import ReplayBuffer
 import chess
 from collections import deque
 import multiprocessing as mp
+import os
+import time
 
 
 class Node:
@@ -40,12 +42,15 @@ class MCTS:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CNNNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.5)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=(self.device.type == "cuda"))
         self.memory = ReplayBuffer(capacity=buffer_size)
         self.batch_size = batch_size
         self.num_simulations = num_simulations
-        
+
         # Cache for action masks
         self._action_mask_cache = {}
+
 
     def get_legal_moves_array(self, board):
         """Get legal moves and convert to proper action indices."""
@@ -189,32 +194,49 @@ class MCTS:
             (entry["state"], entry["pi"], z if entry["turn"] == chess.WHITE else -z)
             for entry in trajectory
         ]
-        return data
+
+        if board.is_game_over():
+            result = board.result()
+            if result == "1-0":   outcome = "white"
+            elif result == "0-1": outcome = "black"
+            else:                 outcome = "draw"
+        else:
+            outcome = "limit"
+
+        meta = {"moves": len(trajectory), "outcome": outcome}
+        return data, meta
 
     def train_network(self, num_batches=50):
+        total_vl = total_pl = 0.0
         for _ in range(num_batches):
             batch = self.memory.sample(batch_size=self.batch_size)
             states, target_pis, target_vs = batch
 
-            # Batch tensor conversion
             states_tensor = torch.FloatTensor(states).to(self.device)
             target_pis_tensor = torch.FloatTensor(target_pis).to(self.device)
             target_vs_tensor = torch.FloatTensor(target_vs).to(self.device)
 
-            # Forward pass
-            pred_p, pred_v = self.model(states_tensor)
-            pred_p = pred_p.view(pred_p.size(0), -1)
-
-            # Combined loss
-            value_loss = nn.MSELoss()(pred_v, target_vs_tensor)
-            log_probs = torch.log_softmax(pred_p, dim=1)
-            policy_loss = -(target_pis_tensor * log_probs).sum(dim=1).mean()
-            
-            loss = value_loss + policy_loss
+            with torch.autocast(device_type=self.device.type):
+                pred_p, pred_v = self.model(states_tensor)
+                pred_p = pred_p.view(pred_p.size(0), -1)
+                value_loss = nn.MSELoss()(pred_v, target_vs_tensor)
+                log_probs = torch.log_softmax(pred_p, dim=1)
+                policy_loss = -(target_pis_tensor * log_probs).sum(dim=1).mean()
+                loss = value_loss + policy_loss
 
             self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            total_vl += value_loss.item()
+            total_pl += policy_loss.item()
+
+        return {
+            "value_loss":  total_vl / num_batches,
+            "policy_loss": total_pl / num_batches,
+            "total_loss":  (total_vl + total_pl) / num_batches,
+        }
 
     def get_game_result(self, board):
         """Get result of game."""
@@ -242,9 +264,12 @@ def _worker_play_games(args):
     agent.model.eval()
 
     all_data = []
+    all_meta = []
     for _ in range(num_games):
-        all_data.extend(agent.play_game(max_moves=max_moves))
-    return all_data
+        data, meta = agent.play_game(max_moves=max_moves)
+        all_data.extend(data)
+        all_meta.append(meta)
+    return all_data, all_meta
 
 
 def run_training(
@@ -266,7 +291,7 @@ def run_training(
         print(f"Episode {ep+1}/{episodes}")
 
         for game_idx in range(num_games_per_episode):
-            game_data = mcts.play_game()
+            game_data, _ = mcts.play_game()
             for state, policy, value in game_data:
                 mcts.memory.add(state, policy, np.array([value]))
 
@@ -314,43 +339,140 @@ def run_training_parallel(
     print("Initializing Parallel MCTS Training...")
     mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
 
+    # --- RESUME ---
+    start_ep = 0
+    if os.path.exists("checkpoint_latest.pt"):
+        print("Found checkpoint_latest.pt — resuming...")
+        ckpt = torch.load("checkpoint_latest.pt", map_location=mcts.device)
+        mcts.model.load_state_dict(ckpt["model"])
+        mcts.optimizer.load_state_dict(ckpt["optimizer"])
+        mcts.scheduler.load_state_dict(ckpt["scheduler"])
+        mcts.scaler.load_state_dict(ckpt["scaler"])
+        start_ep = ckpt["episode"] + 1
+        print(f"  Resumed from episode {ckpt['episode'] + 1}")
+
+        if os.path.exists("buffer_latest.npz"):
+            data = np.load("buffer_latest.npz")
+            n = int(data["size"])
+            mcts.memory.states[:n] = data["states"]
+            mcts.memory.policies[:n] = data["policies"]
+            mcts.memory.values[:n] = data["values"]
+            mcts.memory.index = int(data["index"])
+            mcts.memory.size = n
+            print(f"  Replay buffer restored: {n} positions")
+
     total_games = num_workers * games_per_worker
     print(f"Device (training): {mcts.device}")
     print(f"Workers: {num_workers}  |  Games/episode: {total_games}")
     print(f"Simulations/position: {num_simulations}  |  Batch size: {batch_size}\n")
 
+    episode_times = []
+
+    def fmt_time(seconds):
+        seconds = int(seconds)
+        h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+        if h > 0:
+            return f"{h}h {m:02d}m {s:02d}s"
+        elif m > 0:
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
+
     with mp.Pool(processes=num_workers) as pool:
-        for ep in range(episodes):
+        for ep in range(start_ep, episodes):
+            ep_start = time.time()
+            print(f"\n{'─' * 56}")
             print(f"Episode {ep+1}/{episodes}")
 
             # --- 1. PARALLEL SELF-PLAY ---
-            # Ship CPU state_dict to workers (CUDA tensors can't cross process boundaries)
             cpu_state_dict = {k: v.cpu() for k, v in mcts.model.state_dict().items()}
             worker_args = [
                 (cpu_state_dict, games_per_worker, num_simulations, max_moves, i)
                 for i in range(num_workers)
             ]
-            results = pool.map(_worker_play_games, worker_args)
+
+            sp_start = time.time()
+            all_game_data = []
+            all_meta = []
+            workers_done = 0
+            for game_data, game_meta in pool.imap_unordered(_worker_play_games, worker_args):
+                workers_done += 1
+                all_game_data.append(game_data)
+                all_meta.extend(game_meta)
+                print(f"\r  Self-play  [{workers_done}/{num_workers} workers done]", end="", flush=True)
+            sp_time = time.time() - sp_start
 
             # --- 2. COLLECT DATA ---
             total_positions = 0
-            for game_data in results:
+            for game_data in all_game_data:
                 for state, policy, value in game_data:
                     mcts.memory.add(state, policy, np.array([value]))
                     total_positions += 1
-            print(f"  Collected {total_positions} positions | Buffer: {len(mcts.memory)}")
+
+            outcomes = [m["outcome"] for m in all_meta]
+            avg_moves = sum(m["moves"] for m in all_meta) / max(len(all_meta), 1)
+            n_games = len(all_meta)
+            w = outcomes.count("white")
+            b = outcomes.count("black")
+            d = outcomes.count("draw")
+            lim = outcomes.count("limit")
+
+            print(f"\r  Self-play  {n_games} games | {total_positions} positions | "
+                  f"avg {avg_moves:.0f} moves | "
+                  f"W {w/n_games*100:.0f}% D {d/n_games*100:.0f}% B {b/n_games*100:.0f}%"
+                  + (f" limit {lim/n_games*100:.0f}%" if lim else "")
+                  + f" | {fmt_time(sp_time)}")
 
             # --- 3. TRAIN ON GPU ---
+            tr_start = time.time()
             if len(mcts.memory) > batch_size:
-                print(f"  Training... ", end="", flush=True)
-                mcts.train_network(num_batches=train_batches)
-                print("done")
+                losses = mcts.train_network(num_batches=train_batches)
+                tr_time = time.time() - tr_start
+                print(f"  Training   {train_batches} batches | "
+                      f"val {losses['value_loss']:.4f}  "
+                      f"pol {losses['policy_loss']:.4f}  "
+                      f"total {losses['total_loss']:.4f} | {fmt_time(tr_time)}")
+            else:
+                print(f"  Training   skipped (buffer {len(mcts.memory)} < batch {batch_size})")
 
-            # --- 4. CHECKPOINT ---
-            if (ep + 1) % 5 == 0:
-                path = f"model_checkpoint_ep{ep+1}.pt"
-                torch.save(mcts.model.state_dict(), path)
-                print(f"  Saved: {path}\n")
+            # --- 4. LR SCHEDULE ---
+            mcts.scheduler.step()
+            current_lr = mcts.optimizer.param_groups[0]['lr']
+
+            buf_pct = len(mcts.memory) / mcts.memory.capacity * 100
+            print(f"  Buffer     {len(mcts.memory):,} / {mcts.memory.capacity:,} ({buf_pct:.1f}%)  "
+                  f"LR {current_lr:.6f}")
+
+            # --- 5. ETA ---
+            ep_time = time.time() - ep_start
+            episode_times.append(ep_time)
+            avg_ep_time = sum(episode_times[-20:]) / len(episode_times[-20:])
+            remaining_eps = episodes - (ep + 1)
+            eta = avg_ep_time * remaining_eps
+            print(f"  Episode time: {fmt_time(ep_time)}  |  ETA: {fmt_time(eta)}")
+
+            # --- 6. CHECKPOINT (every episode) ---
+            torch.save({
+                "episode": ep,
+                "model": mcts.model.state_dict(),
+                "optimizer": mcts.optimizer.state_dict(),
+                "scheduler": mcts.scheduler.state_dict(),
+                "scaler": mcts.scaler.state_dict(),
+            }, "checkpoint_latest.pt")
+
+            n = mcts.memory.size
+            np.savez_compressed(
+                "buffer_latest.npz",
+                states=mcts.memory.states[:n],
+                policies=mcts.memory.policies[:n],
+                values=mcts.memory.values[:n],
+                index=np.array(mcts.memory.index),
+                size=np.array(n),
+            )
+            print(f"  Checkpoint saved (ep {ep+1})")
+
+            if (ep + 1) % 10 == 0:
+                torch.save(mcts.model.state_dict(), f"model_ep{ep+1}.pt")
+                print(f"  Milestone: model_ep{ep+1}.pt")
 
     print("\n" + "="*50)
     print("Training Complete!")
@@ -361,12 +483,13 @@ if __name__ == "__main__":
     # Required on Windows: multiprocessing needs the 'spawn' guard
     mp.freeze_support()
 
-    episodes = 50
-    num_workers = 5          # 5 CPU workers + 1 main process = 6 cores
-    games_per_worker = 2     # 10 games total per episode
-    batch_size = 64
-    num_simulations = 200
+    episodes = 500
+    num_workers = 8          # 8 CPU workers; leaves 2 threads for OS + main process
+    games_per_worker = 3     # 24 games/episode
+    batch_size = 256
+    num_simulations = 400
     max_moves = 200
+    train_batches = 100
 
     run_training_parallel(
         episodes=episodes,
@@ -375,4 +498,5 @@ if __name__ == "__main__":
         batch_size=batch_size,
         num_simulations=num_simulations,
         max_moves=max_moves,
+        train_batches=train_batches,
     )
