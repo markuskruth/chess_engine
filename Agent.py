@@ -10,6 +10,7 @@ from collections import deque
 import multiprocessing as mp
 import os
 import time
+import threading
 
 
 class Node:
@@ -20,7 +21,7 @@ class Node:
         self.state = state
         self.board = board  # Keep board to avoid encoding/decoding
         self.P = None
-        self.N = np.zeros(4672, dtype=np.uint32)  # Use uint32 for memory efficiency
+        self.N = np.zeros(4672, dtype=np.float32)
         self.W = np.zeros(4672, dtype=np.float32)
         self.Q = np.zeros(4672, dtype=np.float32)
         self.children = {}
@@ -31,15 +32,20 @@ class Node:
 
 class MCTS:
     def __init__(
-        self, 
-        env: ChessEnv = None, 
-        buffer_size=100000, 
+        self,
+        env: ChessEnv = None,
+        buffer_size=100000,
         batch_size=16,
-        num_simulations=100):
+        num_simulations=100,
+        leaf_batch_size=8,
+        device=None):
 
         self.env = env if env is not None else ChessEnv()
         self.c = 1.0
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = torch.device(device) if isinstance(device, str) else device
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = CNNNet().to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.5)
@@ -47,58 +53,40 @@ class MCTS:
         self.memory = ReplayBuffer(capacity=buffer_size)
         self.batch_size = batch_size
         self.num_simulations = num_simulations
+        self.leaf_batch_size = leaf_batch_size
+        # Pre-allocated buffer for batched leaf evaluation — reused every call
+        self._leaf_batch_buf = np.zeros((leaf_batch_size, 20, 8, 8), dtype=np.float32)
 
-        # Cache for action masks
-        self._action_mask_cache = {}
 
-
-    def get_legal_moves_array(self, board):
-        """Get legal moves and convert to proper action indices."""
-        return list(board.legal_moves)
-
-    def mask_illegal_moves(self, actions, board=None, state=None):
-        """Mask illegal moves using the board directly (faster)."""
-        if board is not None:
-            action_mask = ChessEnv.get_action_mask(board=board)
-        else:
-            action_mask = ChessEnv.get_action_mask(state=state)
-        action_mask = action_mask.reshape(-1)
-        masked_actions = np.where(action_mask, actions, -np.inf)
-        return masked_actions
 
 
 
     def run_simulation(self, root):
-        """Optimized single MCTS simulation."""
+        """Single MCTS simulation — used by the game UI."""
         node = root
         path = []
-        board = root.board.copy()  # Copy board once for simulation
 
         # Selection phase
         while node.is_expanded:
             ucb = node.Q + self.c * node.P * np.sqrt(node.total_N + 1) / (1 + node.N)
-            # Use node.state (encoded from current player's perspective) for correct masking
-            ucb = self.mask_illegal_moves(ucb, state=node.state)
+            ucb = np.where(node.legal_moves_cache, ucb, -np.inf)  # cached mask
 
             action = int(np.argmax(ucb))
             path.append((node, action))
 
             if action not in node.children:
-                # Create new child node by applying the action
+                # New child: copy only the direct parent's board
+                board = node.board.copy()
                 valid, _ = ChessEnv.apply_action(action, board)
                 if valid:
                     state = ChessEnv.encode_state(board)
-                    new_node = Node(state, board.copy())
+                    new_node = Node(state, board)  # board already is the child's (Fix #2)
                     node.children[action] = new_node
                     node = new_node
                 break
             else:
-                # Traverse existing child
-                valid, _ = ChessEnv.apply_action(action, board)
-                if valid:
-                    node = node.children[action]
-                else:
-                    break
+                # Existing child: follow the pointer, no board work needed (Fix #2)
+                node = node.children[action]
 
         # Expansion & Evaluation
         value = self.expand(node)
@@ -108,31 +96,29 @@ class MCTS:
 
 
     def expand(self, node):
-        """Expansion phase: evaluate node with neural network."""
-        state = node.state
-
-        # Get logprobs and value estimate from neural network
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        """Expansion: evaluate node with NN, compute and cache the action mask (Fix #1)."""
+        state_tensor = torch.FloatTensor(node.state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             p, v = self.model(state_tensor)
 
-        # Flatten policy from (1, 8, 8, 73) to (4672,)
         p = p.cpu().numpy().flatten()
         v = v.cpu().numpy().item()
 
-        # Mask illegal moves (-inf), then apply masked softmax
-        p = self.mask_illegal_moves(p, state=state)
+        # Compute mask from the stored board — no decode_state needed (Fix #1)
+        mask = ChessEnv.get_action_mask(board=node.board).reshape(-1)
+        node.legal_moves_cache = mask  # cache for all future selections through this node
+
+        p = np.where(mask, p, -np.inf)
         valid = ~np.isinf(p)
         if np.any(valid):
             p_max = np.max(p[valid])
             p = np.where(valid, np.exp(p - p_max), 0.0)
         else:
             p = np.zeros_like(p)
-        p = p / (np.sum(p) + 1e-10)
+        p /= (np.sum(p) + 1e-10)
 
         node.P = p
         node.is_expanded = True
-
         return v
 
 
@@ -145,6 +131,99 @@ class MCTS:
             node.total_N += 1  # used in UCB numerator
 
             value = -value  # switch perspective
+
+
+    def run_simulation_batch(self, root):
+        """
+        Run `leaf_batch_size` simulations in one batched forward pass.
+
+        Optimisations applied vs. the naive per-simulation loop:
+          - Selection uses the cached action mask on each node — no decode_state (Fix #1)
+          - Traversing existing children needs no board copy or move application (Fix #2)
+          - New children copy only the direct parent's stored board (Fix #2)
+          - Leaf states are written into a pre-allocated buffer; torch.from_numpy
+            gives a zero-copy view for the forward pass (Fix #5)
+          - Virtual loss (W -= 1) during selection diversifies paths within the batch
+        """
+        paths  = []
+        leaves = []
+
+        # ── 1. SELECTION (with virtual loss) ────────────────────────────
+        for _ in range(self.leaf_batch_size):
+            node = root
+            path = []
+
+            while node.is_expanded:
+                ucb = (node.Q
+                       + self.c * node.P * np.sqrt(node.total_N + 1)
+                       / (1 + node.N))
+                ucb = np.where(node.legal_moves_cache, ucb, -np.inf)  # Fix #1
+
+                action = int(np.argmax(ucb))
+                path.append((node, action))
+
+                # Virtual loss: make this edge look worse to later sims in the batch.
+                # Clamp denominator to 1 so the first visit (N=0) doesn't divide by zero.
+                node.W[action] -= 1.0
+                node.Q[action]  = node.W[action] / max(node.N[action], 1.0)
+
+                if action not in node.children:
+                    # New child: copy only the parent's stored board (Fix #2)
+                    board = node.board.copy()
+                    valid, _ = ChessEnv.apply_action(action, board)
+                    if valid:
+                        state = ChessEnv.encode_state(board)
+                        new_node = Node(state, board)  # board is already the child's (Fix #2)
+                        node.children[action] = new_node
+                        node = new_node
+                    break
+                else:
+                    # Existing child: follow pointer, no board work at all (Fix #2)
+                    node = node.children[action]
+
+            paths.append(path)
+            leaves.append(node)
+
+        # ── 2. BATCHED EVALUATION (Fix #5) ──────────────────────────────
+        # Write into pre-allocated buffer then take a zero-copy torch view
+        for i, leaf in enumerate(leaves):
+            self._leaf_batch_buf[i] = leaf.state
+        states_t = torch.from_numpy(self._leaf_batch_buf)
+        with torch.no_grad():
+            p_batch, v_batch = self.model(states_t)
+
+        p_batch = p_batch.cpu().numpy().reshape(self.leaf_batch_size, -1)  # (B, 4672)
+        v_batch = v_batch.cpu().numpy().flatten()                           # (B,)
+
+        # ── 3. EXPAND + UNDO VIRTUAL LOSS + BACKPROP ────────────────────
+        for i, (leaf, path) in enumerate(zip(leaves, paths)):
+            # Guard: two paths in the same batch can land on the same new node
+            if not leaf.is_expanded:
+                p = p_batch[i]
+                # Compute mask from stored board — no decode_state (Fix #1)
+                mask = ChessEnv.get_action_mask(board=leaf.board).reshape(-1)
+                leaf.legal_moves_cache = mask
+                p = np.where(mask, p, -np.inf)
+                valid = ~np.isinf(p)
+                if np.any(valid):
+                    p_max = np.max(p[valid])
+                    p = np.where(valid, np.exp(p - p_max), 0.0)
+                else:
+                    p = np.zeros_like(p)
+                leaf.P = p / (np.sum(p) + 1e-10)
+                leaf.is_expanded = True
+
+            value = float(v_batch[i])
+
+            # Correct virtual loss and apply real value in one step:
+            # W was decremented by 1; adding (value + 1) cancels it and adds v.
+            # N and total_N were already incremented by the virtual loss above.
+            for node, action in reversed(path):
+                node.N[action]  += 1
+                node.W[action]  += value + 1.0
+                node.Q[action]   = node.W[action] / node.N[action]
+                node.total_N    += 1
+                value = -value
 
 
     def play_game(self, temperature=1.0, max_moves=200):
@@ -160,8 +239,9 @@ class MCTS:
 
             # Fresh MCTS tree for each position
             root = Node(state, board.copy())
-            for _ in range(self.num_simulations):
-                self.run_simulation(root)
+            num_batched = self.num_simulations // self.leaf_batch_size
+            for _ in range(num_batched):
+                self.run_simulation_batch(root)
 
             # Policy from visit counts
             N = root.N.copy().astype(np.float32)
@@ -212,9 +292,10 @@ class MCTS:
             batch = self.memory.sample(batch_size=self.batch_size)
             states, target_pis, target_vs = batch
 
-            states_tensor = torch.FloatTensor(states).to(self.device)
-            target_pis_tensor = torch.FloatTensor(target_pis).to(self.device)
-            target_vs_tensor = torch.FloatTensor(target_vs).to(self.device)
+            # Zero-copy numpy→tensor path; non_blocking overlaps GPU transfer (Fix #7)
+            states_tensor     = torch.from_numpy(states).to(self.device, non_blocking=True)
+            target_pis_tensor = torch.from_numpy(target_pis).to(self.device, non_blocking=True)
+            target_vs_tensor  = torch.from_numpy(target_vs).to(self.device, non_blocking=True)
 
             with torch.autocast(device_type=self.device.type):
                 pred_p, pred_v = self.model(states_tensor)
@@ -246,6 +327,18 @@ class MCTS:
         return 10 if result == "1-0" else (-10 if result == "0-1" else 0)
 
 
+def _save_buffer_bg(states, policies, values, index, size, path):
+    """Background thread target: compress and write the replay buffer (Fix #6)."""
+    np.savez_compressed(
+        path,
+        states=states,
+        policies=policies,
+        values=values,
+        index=np.array(index),
+        size=np.array(size),
+    )
+
+
 def _worker_play_games(args):
     """
     Top-level worker function for multiprocessing (must be module-level to be
@@ -254,12 +347,10 @@ def _worker_play_games(args):
     Runs entirely on CPU — GPU inference at batch-size 1 has too much
     launch overhead to be faster than CPU for this workload.
     """
-    state_dict, num_games, num_simulations, max_moves, worker_id = args
+    state_dict, num_games, num_simulations, max_moves, leaf_batch_size, _ = args
 
-    # Build a local MCTS agent with model pinned to CPU
-    agent = MCTS(num_simulations=num_simulations)
-    agent.device = torch.device("cpu")
-    agent.model = agent.model.cpu()
+    # Build model directly on CPU — avoids allocating on GPU then immediately moving back (Fix #3)
+    agent = MCTS(num_simulations=num_simulations, leaf_batch_size=leaf_batch_size, device='cpu', buffer_size=1)
     agent.model.load_state_dict(state_dict)
     agent.model.eval()
 
@@ -320,6 +411,7 @@ def run_training_parallel(
     num_simulations=200,
     max_moves=200,
     train_batches=50,
+    leaf_batch_size=8,
 ):
     """
     Parallel training loop.
@@ -337,7 +429,7 @@ def run_training_parallel(
     Recommended for a 6-core CPU: num_workers=5 (leaves 1 core for main).
     """
     print("Initializing Parallel MCTS Training...")
-    mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
+    mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations, leaf_batch_size=leaf_batch_size)
 
     # --- RESUME ---
     start_ep = 0
@@ -352,14 +444,17 @@ def run_training_parallel(
         print(f"  Resumed from episode {ckpt['episode'] + 1}")
 
         if os.path.exists("buffer_latest.npz"):
-            data = np.load("buffer_latest.npz")
-            n = int(data["size"])
-            mcts.memory.states[:n] = data["states"]
-            mcts.memory.policies[:n] = data["policies"]
-            mcts.memory.values[:n] = data["values"]
-            mcts.memory.index = int(data["index"])
-            mcts.memory.size = n
-            print(f"  Replay buffer restored: {n} positions")
+            try:
+                data = np.load("buffer_latest.npz")
+                n = int(data["size"])
+                mcts.memory.states[:n] = data["states"]
+                mcts.memory.policies[:n] = data["policies"]
+                mcts.memory.values[:n] = data["values"]
+                mcts.memory.index = int(data["index"])
+                mcts.memory.size = n
+                print(f"  Replay buffer restored: {n} positions")
+            except Exception as e:
+                print(f"  WARNING: buffer_latest.npz is corrupt ({e}), starting with empty buffer")
 
     total_games = num_workers * games_per_worker
     print(f"Device (training): {mcts.device}")
@@ -367,6 +462,7 @@ def run_training_parallel(
     print(f"Simulations/position: {num_simulations}  |  Batch size: {batch_size}\n")
 
     episode_times = []
+    save_thread = None  # background buffer-save thread (Fix #6)
 
     def fmt_time(seconds):
         seconds = int(seconds)
@@ -386,7 +482,7 @@ def run_training_parallel(
             # --- 1. PARALLEL SELF-PLAY ---
             cpu_state_dict = {k: v.cpu() for k, v in mcts.model.state_dict().items()}
             worker_args = [
-                (cpu_state_dict, games_per_worker, num_simulations, max_moves, i)
+                (cpu_state_dict, games_per_worker, num_simulations, max_moves, leaf_batch_size, i)
                 for i in range(num_workers)
             ]
 
@@ -400,6 +496,10 @@ def run_training_parallel(
                 all_meta.extend(game_meta)
                 print(f"\r  Self-play  [{workers_done}/{num_workers} workers done]", end="", flush=True)
             sp_time = time.time() - sp_start
+
+            # Ensure previous episode's buffer save finished before we write to the buffer
+            if save_thread is not None:
+                save_thread.join()
 
             # --- 2. COLLECT DATA ---
             total_positions = 0
@@ -451,6 +551,7 @@ def run_training_parallel(
             print(f"  Episode time: {fmt_time(ep_time)}  |  ETA: {fmt_time(eta)}")
 
             # --- 6. CHECKPOINT (every episode) ---
+            # Model state is small and fast — save synchronously
             torch.save({
                 "episode": ep,
                 "model": mcts.model.state_dict(),
@@ -459,20 +560,33 @@ def run_training_parallel(
                 "scaler": mcts.scaler.state_dict(),
             }, "checkpoint_latest.pt")
 
+            # Buffer save is expensive (up to ~2.4 GB compressed) — run in background
+            # so it overlaps with the next episode's self-play phase (Fix #6).
+            # The join at the top of the loop ensures it finishes before the buffer
+            # is modified again during collect.
             n = mcts.memory.size
-            np.savez_compressed(
-                "buffer_latest.npz",
-                states=mcts.memory.states[:n],
-                policies=mcts.memory.policies[:n],
-                values=mcts.memory.values[:n],
-                index=np.array(mcts.memory.index),
-                size=np.array(n),
+            save_thread = threading.Thread(
+                target=_save_buffer_bg,
+                args=(
+                    mcts.memory.states[:n],
+                    mcts.memory.policies[:n],
+                    mcts.memory.values[:n],
+                    mcts.memory.index,
+                    n,
+                    "buffer_latest.npz",
+                ),
+                daemon=True,
             )
+            save_thread.start()
             print(f"  Checkpoint saved (ep {ep+1})")
 
             if (ep + 1) % 10 == 0:
                 torch.save(mcts.model.state_dict(), f"model_ep{ep+1}.pt")
                 print(f"  Milestone: model_ep{ep+1}.pt")
+
+    # Wait for the last episode's buffer save to finish before exiting
+    if save_thread is not None:
+        save_thread.join()
 
     print("\n" + "="*50)
     print("Training Complete!")
@@ -487,7 +601,8 @@ if __name__ == "__main__":
     num_workers = 8          # 8 CPU workers; leaves 2 threads for OS + main process
     games_per_worker = 3     # 24 games/episode
     batch_size = 256
-    num_simulations = 400
+    num_simulations = 400    # must be divisible by leaf_batch_size
+    leaf_batch_size = 8      # forward passes per MCTS step: 400/8 = 50 batched calls
     max_moves = 200
     train_batches = 100
 
@@ -499,4 +614,5 @@ if __name__ == "__main__":
         num_simulations=num_simulations,
         max_moves=max_moves,
         train_batches=train_batches,
+        leaf_batch_size=leaf_batch_size,
     )
