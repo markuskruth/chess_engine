@@ -7,6 +7,7 @@ from Neuralnet import CNNNet
 from utils import ReplayBuffer
 import chess
 from collections import deque
+import multiprocessing as mp
 
 
 class Node:
@@ -223,16 +224,39 @@ class MCTS:
         return 10 if result == "1-0" else (-10 if result == "0-1" else 0)
 
 
+def _worker_play_games(args):
+    """
+    Top-level worker function for multiprocessing (must be module-level to be
+    picklable on Windows, which uses 'spawn' instead of 'fork').
+
+    Runs entirely on CPU — GPU inference at batch-size 1 has too much
+    launch overhead to be faster than CPU for this workload.
+    """
+    state_dict, num_games, num_simulations, max_moves, worker_id = args
+
+    # Build a local MCTS agent with model pinned to CPU
+    agent = MCTS(num_simulations=num_simulations)
+    agent.device = torch.device("cpu")
+    agent.model = agent.model.cpu()
+    agent.model.load_state_dict(state_dict)
+    agent.model.eval()
+
+    all_data = []
+    for _ in range(num_games):
+        all_data.extend(agent.play_game(max_moves=max_moves))
+    return all_data
+
+
 def run_training(
     episodes,
     num_games_per_episode,
     batch_size,
     num_simulations
     ):
-    """training loop."""
+    """Single-process training loop (kept for reference / quick experiments)."""
     print("Initializing MCTS Chess Training Engine...")
     mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
-    
+
     print(f"Device: {mcts.device}")
     print(f"Running {episodes} episodes with {num_games_per_episode} games per episode")
     print(f"Simulations per position: {num_simulations}")
@@ -241,22 +265,19 @@ def run_training(
     for ep in range(episodes):
         print(f"Episode {ep+1}/{episodes}")
 
-        # 1. SELF-PLAY
         for game_idx in range(num_games_per_episode):
             game_data = mcts.play_game()
             for state, policy, value in game_data:
                 mcts.memory.add(state, policy, np.array([value]))
-            
+
             if (game_idx + 1) % 25 == 0:
                 print(f"  Games: {game_idx + 1}/{num_games_per_episode} | Buffer: {len(mcts.memory)}")
 
-        # 2. TRAIN NETWORK
         if len(mcts.memory) > batch_size:
             print(f"  Training... ", end="", flush=True)
             mcts.train_network(num_batches=50)
             print("done")
-        
-        # 3. Save checkpoint
+
         if (ep + 1) % 5 == 0:
             torch.save(mcts.model.state_dict(), f"model_checkpoint_ep{ep+1}.pt")
             print(f"  Saved: model_checkpoint_ep{ep+1}.pt\n")
@@ -266,15 +287,92 @@ def run_training(
     print("="*50)
 
 
+def run_training_parallel(
+    episodes,
+    num_workers=5,
+    games_per_worker=2,
+    batch_size=64,
+    num_simulations=200,
+    max_moves=200,
+    train_batches=50,
+):
+    """
+    Parallel training loop.
+
+    Self-play is distributed across `num_workers` CPU processes.
+    Network training runs on GPU (or CPU if unavailable) in the main process.
+
+    Each episode:
+      1. Broadcast current model weights (CPU copy) to all workers.
+      2. Workers play `games_per_worker` games each in parallel.
+      3. Main process collects all game data into the replay buffer.
+      4. Main process trains the network for `train_batches` gradient steps.
+      5. Repeat.
+
+    Recommended for a 6-core CPU: num_workers=5 (leaves 1 core for main).
+    """
+    print("Initializing Parallel MCTS Training...")
+    mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
+
+    total_games = num_workers * games_per_worker
+    print(f"Device (training): {mcts.device}")
+    print(f"Workers: {num_workers}  |  Games/episode: {total_games}")
+    print(f"Simulations/position: {num_simulations}  |  Batch size: {batch_size}\n")
+
+    with mp.Pool(processes=num_workers) as pool:
+        for ep in range(episodes):
+            print(f"Episode {ep+1}/{episodes}")
+
+            # --- 1. PARALLEL SELF-PLAY ---
+            # Ship CPU state_dict to workers (CUDA tensors can't cross process boundaries)
+            cpu_state_dict = {k: v.cpu() for k, v in mcts.model.state_dict().items()}
+            worker_args = [
+                (cpu_state_dict, games_per_worker, num_simulations, max_moves, i)
+                for i in range(num_workers)
+            ]
+            results = pool.map(_worker_play_games, worker_args)
+
+            # --- 2. COLLECT DATA ---
+            total_positions = 0
+            for game_data in results:
+                for state, policy, value in game_data:
+                    mcts.memory.add(state, policy, np.array([value]))
+                    total_positions += 1
+            print(f"  Collected {total_positions} positions | Buffer: {len(mcts.memory)}")
+
+            # --- 3. TRAIN ON GPU ---
+            if len(mcts.memory) > batch_size:
+                print(f"  Training... ", end="", flush=True)
+                mcts.train_network(num_batches=train_batches)
+                print("done")
+
+            # --- 4. CHECKPOINT ---
+            if (ep + 1) % 5 == 0:
+                path = f"model_checkpoint_ep{ep+1}.pt"
+                torch.save(mcts.model.state_dict(), path)
+                print(f"  Saved: {path}\n")
+
+    print("\n" + "="*50)
+    print("Training Complete!")
+    print("="*50)
+
+
 if __name__ == "__main__":
+    # Required on Windows: multiprocessing needs the 'spawn' guard
+    mp.freeze_support()
+
     episodes = 50
-    num_games_per_episode = 10
+    num_workers = 5          # 5 CPU workers + 1 main process = 6 cores
+    games_per_worker = 2     # 10 games total per episode
     batch_size = 64
     num_simulations = 200
+    max_moves = 200
 
-    run_training(
+    run_training_parallel(
         episodes=episodes,
-        num_games_per_episode=num_games_per_episode,
+        num_workers=num_workers,
+        games_per_worker=games_per_worker,
         batch_size=batch_size,
-        num_simulations=num_simulations
+        num_simulations=num_simulations,
+        max_moves=max_moves,
     )
