@@ -235,10 +235,6 @@ class ChessEnv:
 
             dx, dy = DIRECTIONS[direction_idx]
 
-            # Flip vertical direction if needed
-            if flip:
-                dy = -dy
-
             to_col = col + dx * distance
             to_row = row - dy * distance  # still in agent coords
 
@@ -248,7 +244,14 @@ class ChessEnv:
 
             if 0 <= to_col < 8 and 0 <= to_row < 8:
                 to_square = chess.square(real_to_col, 7 - real_to_row)
-                move = chess.Move(from_square, to_square)
+                # Queen promotion: pawn reaching the back rank via a queen-like move
+                promo = None
+                piece = board.piece_at(from_square)
+                if piece and piece.piece_type == chess.PAWN:
+                    to_rank = chess.square_rank(to_square)
+                    if to_rank == 7 or to_rank == 0:
+                        promo = chess.QUEEN
+                move = chess.Move(from_square, to_square, promotion=promo)
             else:
                 return False, mover
 
@@ -256,9 +259,6 @@ class ChessEnv:
         elif move_type < 64:
             k_idx = move_type - 56
             dx, dy = KNIGHT_MOVES[k_idx]
-
-            if flip:
-                dy = -dy
 
             to_col = col + dx
             to_row = row - dy
@@ -279,10 +279,8 @@ class ChessEnv:
             direction = promo_idx // 3
             promo_piece = PROMOTIONS[promo_idx % 3]
 
-            # In agent space: always moving "up"
+            # In agent space: always moving "up" (decreasing tensor_row)
             dy = -1
-            if flip:
-                dy = 1
 
             if direction == 0:
                 dx = 0
@@ -321,42 +319,69 @@ class ChessEnv:
     # LEGAL ACTION MASK
     @staticmethod
     def get_action_mask(state=None, board=None):
-        """Returns a boolean (8, 8, 73) mask of legal moves."""
+        """Returns a boolean (8, 8, 73) mask of legal moves.
+
+        The mask is always in the current player's coordinate frame (same
+        frame as encode_state and apply_action):
+          - tensor_row = real_rank  for BLACK  (board is flipped vertically)
+          - tensor_row = 7-real_rank for WHITE
+        The rank-difference direction is also flipped for black so that
+        DIRECTIONS and KNIGHT_MOVES can be looked up uniformly.
+        """
         if state is not None:
             board = ChessEnv.decode_state(state)
 
+        flip = (board.turn == chess.BLACK)
         mask = np.zeros((8, 8, 73), dtype=bool)
 
         for move in board.legal_moves:
             from_sq = move.from_square
             to_sq = move.to_square
-            
-            from_row, from_col = chess.square_rank(from_sq), chess.square_file(from_sq)
-            to_row, to_col = chess.square_rank(to_sq), chess.square_file(to_sq)
-            
-            # Convert to your tensor coordinates (tensor_row = 7 - rank)
-            t_row, t_col = 7 - from_row, from_col
-            
-            dr, dc = to_row - from_row, to_col - from_col
+
+            from_rank = chess.square_rank(from_sq)
+            from_file = chess.square_file(from_sq)
+            to_rank   = chess.square_rank(to_sq)
+            to_file   = chess.square_file(to_sq)
+
+            dc = to_file - from_file  # file diff is the same in both views
+
+            if flip:
+                # For black: tensor_row = real_rank (double flip cancels)
+                t_row = from_rank
+                # Rank direction is inverted in the agent's view
+                dr_agent = -(to_rank - from_rank)
+            else:
+                # For white: tensor_row = 7 - real_rank
+                t_row = 7 - from_rank
+                dr_agent = to_rank - from_rank
+
+            t_col = from_file
             plane = -1
 
             # 1. Under-promotions (Planes 64-72)
-            # Queen promotions are handled as normal moves in planes 0-63
+            # Queen promotions fall through to the queen-move planes (0-55)
             if move.promotion and move.promotion != chess.QUEEN:
-                # 3 directions: capture-left (-1), forward (0), capture-right (1)
-                promo_dir = dc + 1 
-                # 3 pieces: Knight (0), Bishop (1), Rook (2)
-                promo_piece = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}[move.promotion]
+                # direction: 0=forward(dc=0), 1=capture-left(dc=-1), 2=capture-right(dc=1)
+                if dc == 0:
+                    promo_dir = 0
+                elif dc == -1:
+                    promo_dir = 1
+                else:
+                    promo_dir = 2
+                # Piece encoding matches PROMOTIONS = [ROOK, BISHOP, KNIGHT]
+                promo_piece = {chess.ROOK: 0, chess.BISHOP: 1, chess.KNIGHT: 2}[move.promotion]
                 plane = 64 + (promo_dir * 3) + promo_piece
 
             # 2. Knight Moves (Planes 56-63)
-            elif (dr, dc) in KNIGHT_MOVES:
-                plane = 56 + KNIGHT_MOVES.index((dr, dc))
+            # KNIGHT_MOVES stores (dx, dy) = (file_diff, agent_rank_diff)
+            elif (dc, dr_agent) in KNIGHT_MOVES:
+                plane = 56 + KNIGHT_MOVES.index((dc, dr_agent))
 
             # 3. Queen-like Moves (Planes 0-55)
+            # DIRECTIONS stores (dx, dy) = (file_diff, agent_rank_diff)
             else:
-                distance = max(abs(dr), abs(dc))
-                direction = (dr // distance, dc // distance)
+                distance = max(abs(dr_agent), abs(dc))
+                direction = (dc // distance, dr_agent // distance)
                 if direction in DIRECTIONS:
                     dir_idx = DIRECTIONS.index(direction)
                     plane = (dir_idx * 7) + (distance - 1)

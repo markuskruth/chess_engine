@@ -46,10 +46,6 @@ class MCTS:
         # Cache for action masks
         self._action_mask_cache = {}
 
-        # Reward params
-        self.gamma = 0.99  # Discount factor
-        self.lambd = 0.5   # Shaping weight (anneal this to 0 over time)
-
     def get_legal_moves_array(self, board):
         """Get legal moves and convert to proper action indices."""
         return list(board.legal_moves)
@@ -75,28 +71,25 @@ class MCTS:
         # Selection phase
         while node.is_expanded:
             ucb = node.Q + self.c * node.P * np.sqrt(node.total_N + 1) / (1 + node.N)
-            ucb = self.mask_illegal_moves(ucb, board=board)
+            # Use node.state (encoded from current player's perspective) for correct masking
+            ucb = self.mask_illegal_moves(ucb, state=node.state)
 
-            action = np.argmax(ucb)
+            action = int(np.argmax(ucb))
             path.append((node, action))
 
             if action not in node.children:
-                # Create new child node
-                legal_moves = list(board.legal_moves)
-                if action < len(legal_moves):
-                    move = legal_moves[action]
-                    board.push(move)
+                # Create new child node by applying the action
+                valid, _ = ChessEnv.apply_action(action, board)
+                if valid:
                     state = ChessEnv.encode_state(board)
                     new_node = Node(state, board.copy())
-                    new_node.legal_moves_cache = self.get_legal_moves_array(board)
                     node.children[action] = new_node
                     node = new_node
                 break
             else:
                 # Traverse existing child
-                legal_moves = list(board.legal_moves)
-                if action < len(legal_moves):
-                    board.push(legal_moves[action])
+                valid, _ = ChessEnv.apply_action(action, board)
+                if valid:
                     node = node.children[action]
                 else:
                     break
@@ -121,11 +114,15 @@ class MCTS:
         p = p.cpu().numpy().flatten()
         v = v.cpu().numpy().item()
 
+        # Mask illegal moves (-inf), then apply masked softmax
         p = self.mask_illegal_moves(p, state=state)
-        # Convert -inf back to 0 and normalize
-        p = np.where(np.isinf(p), 0, p)
-        p = np.exp(p) if np.max(p) > 0 else p  # Handle log probabilities
-        p = p / (np.sum(p) + 1e-10)  # normalize with epsilon
+        valid = ~np.isinf(p)
+        if np.any(valid):
+            p_max = np.max(p[valid])
+            p = np.where(valid, np.exp(p - p_max), 0.0)
+        else:
+            p = np.zeros_like(p)
+        p = p / (np.sum(p) + 1e-10)
 
         node.P = p
         node.is_expanded = True
@@ -139,68 +136,58 @@ class MCTS:
             node.N[action] += 1
             node.W[action] += value
             node.Q[action] = node.W[action] / node.N[action]
+            node.total_N += 1  # used in UCB numerator
 
             value = -value  # switch perspective
 
 
-    def play_game(self, temperature=1.0):
-        memory = []
+    def play_game(self, temperature=1.0, max_moves=200):
         board = ChessEnv.reset()
-        state = ChessEnv.encode_state(board)
-        
-        root = Node(state, board.copy())
-        
-        move_count = 0
-        max_moves = 200
-        trajectory = [] # Store (state, potential)
+        trajectory = []
 
-        while not board.is_game_over() and move_count < max_moves:
-            phi_s = ChessEnv.get_potential(board) # Current state potential
+        for _ in range(max_moves):
+            if board.is_game_over():
+                break
+
             state = ChessEnv.encode_state(board)
-            
-            # Run MCTS simulations
+            turn = board.turn
+
+            # Fresh MCTS tree for each position
+            root = Node(state, board.copy())
             for _ in range(self.num_simulations):
                 self.run_simulation(root)
 
-            # Get policy and choose move
+            # Policy from visit counts
             N = root.N.copy().astype(np.float32)
             pi = N / (np.sum(N) + 1e-10)
             action_idx = np.random.choice(len(pi), p=pi)
 
-            # Record state before move
-            trajectory.append({
-                "state": state,
-                "pi": pi,
-                "phi": phi_s,
-                "turn": board.turn
-            })
-
-            # Execute move
+            trajectory.append({"state": state, "pi": pi, "turn": turn})
             ChessEnv.apply_action(action_idx, board)
-            move_count += 1
 
-        # Calculate final outcome reward Z
-        z = ChessEnv.get_reward(board)
-        #z = self.get_game_result(board)
-        
-        # BACKFILL SHAPED REWARDS
-        # The target value for training is the cumulative shaped return
-        data = []
-        for i in range(len(trajectory)):
-            # Terminal reward is only added to the very last move
-            r_terminal = z if (i == len(trajectory) - 1) else 0
-            
-            # PBRS Formula: F = gamma * Phi(s_next) - Phi(s_current)
-            phi_curr = trajectory[i]["phi"]
-            phi_next = trajectory[i+1]["phi"] if i+1 < len(trajectory) else 0
-            
-            shaping_term = (self.gamma * phi_next) - phi_curr
-            shaped_reward = r_terminal + (self.lambd * shaping_term)
-            
-            # The network predicts the value from the current player's perspective
-            # Flip sign if it's the opponent's turn relative to the game ender
-            data.append((trajectory[i]["state"], trajectory[i]["pi"], shaped_reward))
+        # --- Determine terminal value from White's perspective ---
+        if board.is_game_over():
+            # Actual game result: +1 White wins, -1 Black wins, 0 draw
+            result = board.result()
+            if result == "1-0":
+                z = 1.0
+            elif result == "0-1":
+                z = -1.0
+            else:
+                z = 0.0
+        else:
+            # Move limit reached: use evaluation function as terminal signal.
+            # get_potential() returns a value in [-1, 1] from White's perspective,
+            # so it directly encodes who is winning and by how much.
+            z = ChessEnv.get_potential(board)
 
+        # Propagate z to every position, flipping sign for Black positions so
+        # the target is always from the current player's perspective (matching
+        # the flipped board encoding).
+        data = [
+            (entry["state"], entry["pi"], z if entry["turn"] == chess.WHITE else -z)
+            for entry in trajectory
+        ]
         return data
 
     def train_network(self, num_batches=50):
