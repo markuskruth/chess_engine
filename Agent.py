@@ -6,6 +6,8 @@ from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
 from utils import ReplayBuffer
 import chess
+import csv
+import random
 from collections import deque
 import multiprocessing as mp
 import os
@@ -188,7 +190,7 @@ class MCTS:
         # Write into pre-allocated buffer then take a zero-copy torch view
         for i, leaf in enumerate(leaves):
             self._leaf_batch_buf[i] = leaf.state
-        states_t = torch.from_numpy(self._leaf_batch_buf)
+        states_t = torch.from_numpy(self._leaf_batch_buf).to(self.device, non_blocking=True)
         with torch.no_grad():
             p_batch, v_batch = self.model(states_t)
 
@@ -262,10 +264,17 @@ class MCTS:
             else:
                 z = 0.0
         else:
-            # Move limit reached: use evaluation function as terminal signal.
-            # get_potential() returns a value in [-1, 1] from White's perspective,
-            # so it directly encodes who is winning and by how much.
-            z = ChessEnv.get_potential(board)
+            # Move limit reached: evaluate position and threshold to decisive/draw.
+            # Only clearly winning/losing positions (|eval| > 0.3 ≈ +230cp) count as decisive.
+            # This gives clean win/draw/loss labels without mimicking the heuristic's
+            # continuous scale.
+            pot = ChessEnv.get_potential(board)
+            if pot > 0.3:
+                z = 1.0
+            elif pot < -0.3:
+                z = -1.0
+            else:
+                z = 0.0
 
         # Propagate z to every position, flipping sign for Black positions so
         # the target is always from the current player's perspective (matching
@@ -319,12 +328,52 @@ class MCTS:
             "total_loss":  (total_vl + total_pl) / num_batches,
         }
 
-    def get_game_result(self, board):
-        """Get result of game."""
-        if not board.is_game_over():
-            return 0
-        result = board.result()
-        return 10 if result == "1-0" else (-10 if result == "0-1" else 0)
+    def evaluate_vs_random(self, num_games=20, num_simulations=100):
+        """
+        Play num_games against a random mover (alternating colors).
+        Returns (win_rate, draw_rate, loss_rate) from the model's perspective.
+        """
+        self.model.eval()
+        wins = draws = losses = 0
+
+        for i in range(num_games):
+            board = chess.Board(ChessEnv.reset().fen())
+            model_color = chess.WHITE if i % 2 == 0 else chess.BLACK
+
+            while not board.is_game_over() and board.fullmove_number < 100:
+                if board.turn == model_color:
+                    state = ChessEnv.encode_state(board)
+                    root = Node(state, board.copy())
+                    num_batched = num_simulations // self.leaf_batch_size
+                    for _ in range(num_batched):
+                        self.run_simulation_batch(root)
+                    action_idx = int(np.argmax(root.N))
+                    ChessEnv.apply_action(action_idx, board)
+                else:
+                    board.push(random.choice(list(board.legal_moves)))
+
+            result = board.result()
+            if (result == "1-0" and model_color == chess.WHITE) or \
+               (result == "0-1" and model_color == chess.BLACK):
+                wins += 1
+            elif (result == "1-0" and model_color == chess.BLACK) or \
+                 (result == "0-1" and model_color == chess.WHITE):
+                losses += 1
+            elif result == "*":
+                # Move limit: use same threshold logic as training
+                pot = ChessEnv.get_potential(board)
+                if (pot > 0.5 and model_color == chess.WHITE) or \
+                   (pot < -0.5 and model_color == chess.BLACK):
+                    wins += 1
+                elif (pot < -0.5 and model_color == chess.WHITE) or \
+                     (pot > 0.5 and model_color == chess.BLACK):
+                    losses += 1
+                else:
+                    draws += 1
+            else:
+                draws += 1
+
+        return wins / num_games, draws / num_games, losses / num_games
 
 
 def _save_buffer_bg(states, policies, values, index, size, path):
@@ -464,6 +513,14 @@ def run_training_parallel(
     episode_times = []
     save_thread = None  # background buffer-save thread (Fix #6)
 
+    # --- EVAL LOG SETUP ---
+    eval_log_path = "eval_log.csv"
+    eval_interval = 5  # run evaluation every N episodes
+    if not os.path.exists(eval_log_path):
+        with open(eval_log_path, "w", newline="") as f:
+            csv.writer(f).writerow(["episode", "win_rate", "draw_rate", "loss_rate",
+                                    "value_loss", "policy_loss"])
+
     def fmt_time(seconds):
         seconds = int(seconds)
         h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
@@ -524,6 +581,7 @@ def run_training_parallel(
 
             # --- 3. TRAIN ON GPU ---
             tr_start = time.time()
+            losses = {}
             if len(mcts.memory) > batch_size:
                 losses = mcts.train_network(num_batches=train_batches)
                 tr_time = time.time() - tr_start
@@ -583,6 +641,18 @@ def run_training_parallel(
             if (ep + 1) % 10 == 0:
                 torch.save(mcts.model.state_dict(), f"model_ep{ep+1}.pt")
                 print(f"  Milestone: model_ep{ep+1}.pt")
+
+            # --- 7. EVALUATION vs RANDOM ---
+            if (ep + 1) % eval_interval == 0:
+                ev_start = time.time()
+                win_r, draw_r, loss_r = mcts.evaluate_vs_random(num_games=20, num_simulations=100)
+                ev_time = time.time() - ev_start
+                val_loss = losses.get("value_loss", float("nan")) if len(mcts.memory) > batch_size else float("nan")
+                pol_loss = losses.get("policy_loss", float("nan")) if len(mcts.memory) > batch_size else float("nan")
+                with open(eval_log_path, "a", newline="") as f:
+                    csv.writer(f).writerow([ep + 1, f"{win_r:.3f}", f"{draw_r:.3f}", f"{loss_r:.3f}",
+                                            f"{val_loss:.4f}", f"{pol_loss:.4f}"])
+                print(f"  Eval vs random  W {win_r*100:.0f}%  D {draw_r*100:.0f}%  L {loss_r*100:.0f}%  | {fmt_time(ev_time)}")
 
     # Wait for the last episode's buffer save to finish before exiting
     if save_thread is not None:

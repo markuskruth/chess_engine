@@ -38,9 +38,9 @@ class CNNNet(nn.Module):
         )
 
         # POLICY HEAD
-        self.policy_conv = nn.Conv2d(channels, 16, kernel_size=1)
-        self.policy_bn = nn.BatchNorm2d(16)
-        self.policy_fc = nn.Linear(16 * 8 * 8, 8 * 8 * 73)
+        self.policy_conv = nn.Conv2d(channels, 32, kernel_size=1)
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_fc = nn.Linear(32 * 8 * 8, 8 * 8 * 73)
 
         # VALUE HEAD
         self.value_conv = nn.Conv2d(channels, 16, kernel_size=1)
