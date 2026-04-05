@@ -174,7 +174,7 @@ class ChessEnv:
 
 
     @staticmethod
-    def get_potential(board):
+    def get_evaluation(board):
         """
         Tapered evaluation function from White's perspective, normalized to [-1, 1].
 

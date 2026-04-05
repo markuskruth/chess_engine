@@ -99,6 +99,17 @@ class MCTS:
 
     def expand(self, node):
         """Expansion: evaluate node with NN, compute and cache the action mask (Fix #1)."""
+        # Terminal nodes have an exact value — no NN call needed or wanted.
+        # board.turn is the player to move, who has no legal moves in a terminal state.
+        # Checkmate: that player is mated → v = -1 from their perspective.
+        # Any draw: v = 0.
+        if node.board.is_game_over():
+            v = -1.0 if node.board.is_checkmate() else 0.0
+            node.P = np.zeros(4672, dtype=np.float32)
+            node.legal_moves_cache = np.zeros(4672, dtype=bool)
+            node.is_expanded = True
+            return v
+
         state_tensor = torch.FloatTensor(node.state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             p, v = self.model(state_tensor)
@@ -127,12 +138,11 @@ class MCTS:
     def backpropagate(self, path, value):
         """Backpropagation phase: update statistics along the path."""
         for node, action in reversed(path):
+            value = -value  # switch perspective
             node.N[action] += 1
             node.W[action] += value
             node.Q[action] = node.W[action] / node.N[action]
             node.total_N += 1  # used in UCB numerator
-
-            value = -value  # switch perspective
 
 
     def run_simulation_batch(self, root):
@@ -150,7 +160,7 @@ class MCTS:
         paths  = []
         leaves = []
 
-        # ── 1. SELECTION (with virtual loss) ────────────────────────────
+        # SELECTION (with virtual loss)
         for _ in range(self.leaf_batch_size):
             node = root
             path = []
@@ -186,7 +196,7 @@ class MCTS:
             paths.append(path)
             leaves.append(node)
 
-        # ── 2. BATCHED EVALUATION (Fix #5) ──────────────────────────────
+        # BATCHED EVALUATION
         # Write into pre-allocated buffer then take a zero-copy torch view
         for i, leaf in enumerate(leaves):
             self._leaf_batch_buf[i] = leaf.state
@@ -197,35 +207,46 @@ class MCTS:
         p_batch = p_batch.cpu().numpy().reshape(self.leaf_batch_size, -1)  # (B, 4672)
         v_batch = v_batch.cpu().numpy().flatten()                           # (B,)
 
-        # ── 3. EXPAND + UNDO VIRTUAL LOSS + BACKPROP ────────────────────
+        # EXPAND + UNDO VIRTUAL LOSS + BACKPROP
         for i, (leaf, path) in enumerate(zip(leaves, paths)):
             # Guard: two paths in the same batch can land on the same new node
             if not leaf.is_expanded:
-                p = p_batch[i]
-                # Compute mask from stored board — no decode_state (Fix #1)
-                mask = ChessEnv.get_action_mask(board=leaf.board).reshape(-1)
-                leaf.legal_moves_cache = mask
-                p = np.where(mask, p, -np.inf)
-                valid = ~np.isinf(p)
-                if np.any(valid):
-                    p_max = np.max(p[valid])
-                    p = np.where(valid, np.exp(p - p_max), 0.0)
+                if leaf.board.is_game_over():
+                    # Exact terminal value — never use the NN output for this
+                    value = -1.0 if leaf.board.is_checkmate() else 0.0
+                    leaf.P = np.zeros(4672, dtype=np.float32)
+                    leaf.legal_moves_cache = np.zeros(4672, dtype=bool)
+                    leaf.is_expanded = True
                 else:
-                    p = np.zeros_like(p)
-                leaf.P = p / (np.sum(p) + 1e-10)
-                leaf.is_expanded = True
-
-            value = float(v_batch[i])
+                    value = float(v_batch[i])
+                    p = p_batch[i]
+                    # Compute mask from stored board — no decode_state (Fix #1)
+                    mask = ChessEnv.get_action_mask(board=leaf.board).reshape(-1)
+                    leaf.legal_moves_cache = mask
+                    p = np.where(mask, p, -np.inf)
+                    valid = ~np.isinf(p)
+                    if np.any(valid):
+                        p_max = np.max(p[valid])
+                        p = np.where(valid, np.exp(p - p_max), 0.0)
+                    else:
+                        p = np.zeros_like(p)
+                    leaf.P = p / (np.sum(p) + 1e-10)
+                    leaf.is_expanded = True
+            else:
+                # Already expanded (duplicate path in same batch): get exact value
+                # for terminals, NN value for non-terminals
+                value = (-1.0 if leaf.board.is_checkmate() else 0.0) \
+                        if leaf.board.is_game_over() else float(v_batch[i])
 
             # Correct virtual loss and apply real value in one step:
             # W was decremented by 1; adding (value + 1) cancels it and adds v.
             # N and total_N were already incremented by the virtual loss above.
             for node, action in reversed(path):
+                value = -value  # flip perspective
                 node.N[action]  += 1
                 node.W[action]  += value + 1.0
                 node.Q[action]   = node.W[action] / node.N[action]
                 node.total_N    += 1
-                value = -value
 
 
     def play_game(self, temperature=1.0, max_moves=200):
@@ -268,7 +289,8 @@ class MCTS:
             # Only clearly winning/losing positions (|eval| > 0.3 ≈ +230cp) count as decisive.
             # This gives clean win/draw/loss labels without mimicking the heuristic's
             # continuous scale.
-            pot = ChessEnv.get_potential(board)
+            # Potential is always given from real whites perspective
+            pot = ChessEnv.get_evaluation(board)
             if pot > 0.3:
                 z = 1.0
             elif pot < -0.3:
@@ -361,7 +383,7 @@ class MCTS:
                 losses += 1
             elif result == "*":
                 # Move limit: use same threshold logic as training
-                pot = ChessEnv.get_potential(board)
+                pot = ChessEnv.get_evaluation(board)
                 if (pot > 0.5 and model_color == chess.WHITE) or \
                    (pot < -0.5 and model_color == chess.BLACK):
                     wins += 1
@@ -662,7 +684,67 @@ def run_training_parallel(
     print("Training Complete!")
     print("="*50)
 
+def run_benchmark(model_path="checkpoint_latest.pt", num_games=20, num_simulations=100, leaf_batch_size=8):
+    if not os.path.exists(model_path):
+        print(f"Error: Could not find model file at '{model_path}'")
+        return
 
+    print(f"Loading model from {model_path}...")
+    
+    # Initialize MCTS agent
+    # We set buffer_size=1 since we aren't training
+    mcts = MCTS(
+        num_simulations=num_simulations, 
+        leaf_batch_size=leaf_batch_size, 
+        buffer_size=1
+    )
+    
+    # Load the checkpoint safely to the configured device
+    checkpoint = torch.load(model_path, map_location=mcts.device)
+    
+    # Handle both your saved formats: dictionary (checkpoint_latest) or raw weights (model_epX)
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        mcts.model.load_state_dict(checkpoint["model"])
+        print(f"Loaded full checkpoint (from episode {checkpoint.get('episode', 'unknown')}).")
+    else:
+        mcts.model.load_state_dict(checkpoint)
+        print("Loaded raw model weights.")
+        
+    mcts.model.eval()
+    
+    print(f"\nStarting benchmark: {num_games} games vs Random Mover...")
+    print(f"Agent plays White on even games, Black on odd games.")
+    print("Evaluating...\n")
+    
+    start_time = time.time()
+    
+    # Call your existing evaluation function
+    win_r, draw_r, loss_r = mcts.evaluate_vs_random(
+        num_games=num_games, 
+        num_simulations=num_simulations
+    )
+    
+    elapsed = time.time() - start_time
+    
+    print("=" * 40)
+    print(" 🎯 BENCHMARK RESULTS")
+    print("=" * 40)
+    print(f"  Wins:   {win_r * 100:>5.1f}%")
+    print(f"  Draws:  {draw_r * 100:>5.1f}%")
+    print(f"  Losses: {loss_r * 100:>5.1f}%")
+    print("-" * 40)
+    print(f"  Time:   {elapsed:.1f} seconds")
+    print("=" * 40)
+"""
+if __name__ == "__main__":
+    # You can change the model_path to point to whichever .pt file you want to test
+    run_benchmark(
+        model_path="checkpoint_latest.pt", 
+        num_games=20,           # Increase for a more statistically significant test
+        num_simulations=100,    # Number of MCTS rollouts per move
+        leaf_batch_size=8       # Make sure this matches how the MCTS was initialized
+    )
+"""
 if __name__ == "__main__":
     # Required on Windows: multiprocessing needs the 'spawn' guard
     mp.freeze_support()
