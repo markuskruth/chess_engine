@@ -1,406 +1,780 @@
-import pygame
+#!/usr/bin/env python3
+"""
+Chess RL GUI
+PySide6 + python-chess SVG rendering.
+
+Install dependency:  pip install pyside6
+"""
+
 import sys
+import os
+import random
+from typing import Optional
+
 import chess
-import torch
+import chess.svg
 import numpy as np
-from Agent import MCTS, Node
+import torch
+
+from PySide6.QtCore    import Qt, QByteArray, QThread, Signal, QTimer
+from PySide6.QtGui     import QColor, QFont, QPainter, QPen
+from PySide6.QtSvgWidgets import QSvgWidget
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QGroupBox, QHBoxLayout, QLabel,
+    QMainWindow, QProgressBar, QPushButton, QRadioButton,
+    QSizePolicy, QVBoxLayout, QWidget,
+)
+
+from Agent      import MCTS, Node
+from ChessEnv   import ChessEnv
 from MCTS_simple import MCTS_simple
-from ChessEnv import ChessEnv
-from Neuralnet import CNNNet
 
-START_FEN = "4k3/7R/K7/R7/8/8/8/8 w - - 0 1"
-LATEST_MODEL = "model_checkpoint_ep20.pt"
-NUM_SIMULATIONS = 10000
-
-pygame.init()
-
-# Display
-display_size = 800
-square_size = display_size // 8
-win = pygame.display.set_mode((display_size, display_size))
-pygame.display.set_caption("Chess RL - Play Against Trained Model")
-
-img_path = "images/"
-
-# Load images
-pieces = {
-    "P": pygame.image.load(f"{img_path}whitePawn.png"),
-    "R": pygame.image.load(f"{img_path}whiteRook.png"),
-    "N": pygame.image.load(f"{img_path}whiteKnight.png"),
-    "B": pygame.image.load(f"{img_path}whiteBishop.png"),
-    "Q": pygame.image.load(f"{img_path}whiteQueen.png"),
-    "K": pygame.image.load(f"{img_path}whiteKing.png"),
-    "p": pygame.image.load(f"{img_path}blackPawn.png"),
-    "r": pygame.image.load(f"{img_path}blackRook.png"),
-    "n": pygame.image.load(f"{img_path}blackKnight.png"),
-    "b": pygame.image.load(f"{img_path}blackBishop.png"),
-    "q": pygame.image.load(f"{img_path}blackQueen.png"),
-    "k": pygame.image.load(f"{img_path}blackKing.png"),
-}
-
-# Scale images
-for key in pieces:
-    pieces[key] = pygame.transform.scale(pieces[key], (square_size, square_size))
-
-# Global variables
-ai_agent = None
-mcts_simple_agent = None
-human_color = chess.WHITE
-ai_type = None  # 'neural' or 'simple'
-game_over = False
-message = ""
-last_move = None
+# ── Constants ─────────────────────────────────────────────────────────────────
+BOARD_SIZE     = 600     # pixels
+NUM_SIM_NEURAL = 800     # simulations per AI move (neural); divisible by LEAF_BATCH
+NUM_SIM_SIMPLE = 5_000   # simulations per AI move (simple MCTS)
+LEAF_BATCH     = 8       # must match the value used during training
+TOP_N          = 5       # move rows shown in the probability panel
 
 
-# Convert mouse position to chess square
-def get_square_from_mouse(pos):
-    x, y = pos
-    file = x // square_size
-    rank = 7 - (y // square_size)  # flip board vertically
-    return chess.square(file, rank)
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_top_moves(root: Node, board: chess.Board, n: int = TOP_N) -> list:
+    """Return up to n moves from root sorted by visit count."""
+    if not root.is_expanded or root.legal_moves_cache is None:
+        return []
+    total = float(np.sum(root.N))
+    if total == 0:
+        return []
+    legal  = np.where(root.legal_moves_cache)[0]
+    order  = np.argsort(-root.N[legal])[:n]
+    result = []
+    for i in order:
+        idx    = int(legal[i])
+        visits = float(root.N[idx])
+        if visits == 0:
+            break
+        b = board.copy()
+        valid, move = ChessEnv.apply_action(idx, b)
+        if valid:
+            result.append({
+                "uci":    move.uci(),
+                "visits": int(visits),
+                "pct":    visits / total * 100,
+            })
+    return result
 
 
-def initialize_game():
-    """Initialize the selected AI type."""
-    global human_color, ai_agent, mcts_simple_agent, game_over, message, ai_type
-    
-    if ai_type == 'neural':
-        print("Initializing Neural AI agent...")
+def load_latest_model(agent: MCTS) -> Optional[str]:
+    """
+    Try to load the most recent model weights into agent.model.
+    Preference order: checkpoint_latest.pt > model_ep*.pt > model_checkpoint*.pt
+    Returns the filename on success, None if nothing is found / all fail.
+    """
+    candidates: list[str] = []
+    try:
+        for name in sorted(os.listdir(".")):
+            if name == "checkpoint_latest.pt":
+                candidates.insert(0, name)
+            elif name.startswith("model_ep") or name.startswith("model_checkpoint"):
+                candidates.append(name)
+    except OSError:
+        return None
+
+    for fname in candidates:
         try:
-            ai_agent = MCTS(buffer_size=100000)
-            # Try to load a trained model if it exists
-            import os
-            model_files = [f for f in os.listdir('.') if f.startswith('model_checkpoint')]
-            if model_files:
-                ai_agent.model.load_state_dict(torch.load(LATEST_MODEL, map_location=ai_agent.device))
-                ai_agent.model.eval()
-                print(f"Loaded {LATEST_MODEL}")
-                message = f"AI Type: Neural MCTS | Loaded {LATEST_MODEL}"
+            ckpt = torch.load(fname, map_location=agent.device)
+            state = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
+            agent.model.load_state_dict(state)
+            agent.model.eval()
+            return fname
+        except Exception:
+            continue
+    return None
+
+
+# ── Eval Bar ──────────────────────────────────────────────────────────────────
+
+class EvalBar(QWidget):
+    """
+    Thin vertical bar: black fills from the top, white fills from the bottom.
+    value in [-1, 1]:  +1 = white winning,  -1 = black winning.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._value: float = 0.0
+        self.setFixedWidth(22)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setToolTip("Position evaluation  (W = white advantage, B = black advantage)")
+
+    def set_value(self, v: float) -> None:
+        self._value = max(-1.0, min(1.0, float(v)))
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        p   = QPainter(self)
+        w   = self.width()
+        h   = self.height()
+
+        # Background = black player's colour
+        p.fillRect(0, 0, w, h, QColor(30, 30, 30))
+
+        # White portion grows from bottom
+        white_h = int((self._value + 1.0) / 2.0 * h)
+        p.fillRect(0, h - white_h, w, white_h, QColor(225, 225, 225))
+
+        # Centre divider
+        p.setPen(QPen(QColor(110, 110, 110), 1))
+        p.drawLine(0, h // 2, w, h // 2)
+
+        # Labels
+        font = QFont("Arial", 7, QFont.Bold)
+        p.setFont(font)
+        p.setPen(QColor(200, 200, 200))
+        p.drawText(0, 2, w, 14, Qt.AlignHCenter, "B")
+        p.setPen(QColor(80, 80, 80))
+        p.drawText(0, h - 14, w, 14, Qt.AlignHCenter, "W")
+
+
+# ── Move Probability Panel ────────────────────────────────────────────────────
+
+class _MoveRow(QWidget):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 1, 0, 1)
+        layout.setSpacing(4)
+
+        self.lbl_move = QLabel("----")
+        self.lbl_move.setFixedWidth(46)
+        self.lbl_move.setFont(QFont("Courier", 9, QFont.Bold))
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(13)
+        self.bar.setStyleSheet(
+            "QProgressBar { background:#ddd; border-radius:2px; }"
+            "QProgressBar::chunk { background:#4a90d9; border-radius:2px; }"
+        )
+
+        self.lbl_pct = QLabel("  0%")
+        self.lbl_pct.setFixedWidth(32)
+        self.lbl_pct.setFont(QFont("Courier", 9))
+        self.lbl_pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addWidget(self.lbl_move)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.lbl_pct)
+
+    def set_data(self, uci: str, pct: float) -> None:
+        self.lbl_move.setText(uci)
+        self.bar.setValue(int(pct))
+        self.lbl_pct.setText(f"{pct:3.0f}%")
+
+
+class MoveProbPanel(QGroupBox):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Top Moves", parent)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(2)
+        self._rows = [_MoveRow() for _ in range(TOP_N)]
+        for row in self._rows:
+            layout.addWidget(row)
+        self.clear()
+
+    def update_moves(self, moves: list) -> None:
+        for i, row in enumerate(self._rows):
+            if i < len(moves):
+                row.set_data(moves[i]["uci"], moves[i]["pct"])
+                row.setVisible(True)
             else:
-                print("No trained model found. Using untrained model.")
-                message = "AI Type: Neural MCTS | Using untrained model"
-        except Exception as e:
-            print(f"Error initializing Neural AI: {e}")
-            message = f"Error loading model: {e}"
+                row.setVisible(False)
+
+    def clear(self) -> None:
+        for row in self._rows:
+            row.setVisible(False)
+
+
+# ── Chess Board Widget ────────────────────────────────────────────────────────
+
+class ChessBoardWidget(QSvgWidget):
+    """
+    Renders the board using chess.svg.  No image files needed.
+
+    Click interaction:
+      • First click  — select a friendly piece; legal destinations are dotted.
+      • Second click — move to a destination (queen-promotion auto-applied);
+                       clicking another friendly piece re-selects instead.
+
+    Coordinate mapping (coordinates=False ⇒ board fills the entire SVG):
+      White orientation:  file = col,     rank = 7 − row
+      Black orientation:  file = 7 − col, rank = row
+    """
+
+    human_move = Signal(chess.Move)
+
+    def __init__(
+        self,
+        human_color: chess.Color = chess.WHITE,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.human_color  = human_color
+        self.board        = chess.Board()
+        self.last_move:   Optional[chess.Move]   = None
+        self.selected_sq: Optional[chess.Square] = None
+        self.legal_dests: set[chess.Square]       = set()
+        self.arrows:      list                    = []
+        self.interactive: bool                    = True
+
+        self.setFixedSize(BOARD_SIZE, BOARD_SIZE)
+        self.update_board()
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
+
+    def update_board(self) -> None:
+        orientation = chess.WHITE if self.human_color == chess.WHITE else chess.BLACK
+
+        fill: dict[chess.Square, str] = {}
+        if self.selected_sq is not None:
+            fill[self.selected_sq] = "#7fc97f"      # green selection tint
+
+        svg = chess.svg.board(
+            self.board,
+            orientation  = orientation,
+            lastmove     = self.last_move,
+            fill         = fill,
+            squares      = chess.SquareSet(self.legal_dests),
+            arrows       = self.arrows,
+            size         = BOARD_SIZE,
+            coordinates  = False,   # no border labels → no margin offset needed
+        )
+        self.load(QByteArray(svg.encode("utf-8")))
+
+    # ── Input handling ────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event) -> None:
+        if not self.interactive or event.button() != Qt.LeftButton:
             return
-    elif ai_type == 'simple':
-        print("Initializing Simple MCTS agent...")
-        try:
-            mcts_simple_agent = MCTS_simple(num_simulations=NUM_SIMULATIONS)
-            message = f"AI Type: Simple MCTS | Simulations: {NUM_SIMULATIONS}"
-            print(f"Initialized Simple MCTS with {NUM_SIMULATIONS} simulations")
-        except Exception as e:
-            print(f"Error initializing Simple MCTS: {e}")
-            message = f"Error initializing Simple MCTS: {e}"
+        if self.board.turn != self.human_color or self.board.is_game_over():
             return
-    
-    game_over = False
 
+        sq = self._pixel_to_square(event.position().x(), event.position().y())
 
-def draw_ai_type_menu():
-    """Draw AI type selection menu."""
-    font_title = pygame.font.Font(None, 48)
-    font_text = pygame.font.Font(None, 36)
-    
-    title = font_title.render("Choose AI Type", True, (0, 0, 0))
-    neural_text = font_text.render("Press N for Neural MCTS (with AI)", True, (100, 100, 200))
-    simple_text = font_text.render("Press S for Simple MCTS (no AI)", True, (100, 100, 200))
-    
-    win.fill((240, 217, 181))
-    win.blit(title, (display_size // 2 - title.get_width() // 2, 100))
-    win.blit(neural_text, (display_size // 2 - neural_text.get_width() // 2, 250))
-    win.blit(simple_text, (display_size // 2 - simple_text.get_width() // 2, 350))
-    pygame.display.update()
-
-
-def draw_color_menu():
-    """Draw color selection menu."""
-    font = pygame.font.Font(None, 36)
-    title = font.render("Choose Your Color", True, (0, 0, 0))
-    white_text = font.render("Press W for White", True, (200, 200, 200))
-    black_text = font.render("Press B for Black", True, (50, 50, 50))
-    
-    win.fill((240, 217, 181))
-    win.blit(title, (display_size // 2 - title.get_width() // 2, 150))
-    win.blit(white_text, (display_size // 2 - white_text.get_width() // 2, 300))
-    win.blit(black_text, (display_size // 2 - black_text.get_width() // 2, 400))
-    pygame.display.update()
-
-
-def ai_make_move_neural(board, temperature=1.0):
-    """Use Neural MCTS to select and make a move. Model acts as a guide in UCB computation."""
-    global message
-    
-    try:
-        legal_moves = list(board.legal_moves)
-        if not legal_moves:
-            return
-        
-        # Create root node for MCTS tree
-        state = ChessEnv.encode_state(board)
-        root = Node(state, board.copy())
-        
-        # Run MCTS simulations
-        for _ in range(NUM_SIMULATIONS):
-            ai_agent.run_simulation(root)
-        
-        # Get policy
-        N = root.N.copy().astype(np.float32)
-        pi = N ** temperature
-        pi = pi / (np.sum(pi) + 1e-10)
-        
-        # Select action with highest visit count
-        action_idx = np.argmax(pi)
-        
-        # Execute move
-        valid, move = ChessEnv.apply_action(action_idx, board)
-
-        color_name = "White" if board.turn == chess.BLACK else "Black"
-        message = f"Neural AI ({color_name}) played: {move.uci()}"
-        
-    except Exception as e:
-        print(f"Error in Neural AI move: {e}")
-        message = f"Neural AI Error: {e}"
-        # Fallback: make random legal move
-        legal_moves = list(board.legal_moves)
-        if legal_moves:
-            board.push(legal_moves[0])
-
-
-def ai_make_move_simple(board):
-    """Use Simple MCTS to select and make a move (no neural network)."""
-    global message
-    
-    try:
-        legal_moves = list(board.legal_moves)
-        if not legal_moves:
-            return
-        
-        # Get best move using Simple MCTS
-        move = mcts_simple_agent.best_move(board)
-        
-        if move and move in board.legal_moves:
-            board.push(move)
-            color_name = "White" if board.turn == chess.BLACK else "Black"
-            message = f"Simple MCTS ({color_name}) played: {move.uci()}"
+        if self.selected_sq is None:
+            # ── Select piece ───────────────────────────────────────────────
+            piece = self.board.piece_at(sq)
+            if piece and piece.color == self.human_color:
+                self.selected_sq = sq
+                self.legal_dests = {
+                    m.to_square for m in self.board.legal_moves
+                    if m.from_square == sq
+                }
+                self.update_board()
         else:
-            # Fallback: make random legal move
-            move = legal_moves[0]
-            board.push(move)
-            message = f"Simple MCTS played random move: {move.uci()}"
-        
-    except Exception as e:
-        print(f"Error in Simple MCTS move: {e}")
-        message = f"Simple MCTS Error: {e}"
-        # Fallback: make random legal move
-        legal_moves = list(board.legal_moves)
-        if legal_moves:
-            board.push(legal_moves[0])
+            # ── Attempt move ───────────────────────────────────────────────
+            move  = chess.Move(self.selected_sq, sq)
+            promo = chess.Move(self.selected_sq, sq, promotion=chess.QUEEN)
+
+            made: Optional[chess.Move] = None
+            if   move  in self.board.legal_moves: made = move
+            elif promo in self.board.legal_moves: made = promo
+
+            if made is not None:
+                self.selected_sq = None
+                self.legal_dests = set()
+                self.arrows      = []
+                self.human_move.emit(made)
+            else:
+                # Re-select a different piece or deselect
+                piece = self.board.piece_at(sq)
+                if piece and piece.color == self.human_color:
+                    self.selected_sq = sq
+                    self.legal_dests = {
+                        m.to_square for m in self.board.legal_moves
+                        if m.from_square == sq
+                    }
+                else:
+                    self.selected_sq = None
+                    self.legal_dests = set()
+                self.update_board()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _pixel_to_square(self, px: float, py: float) -> chess.Square:
+        w   = self.width()
+        h   = self.height()
+        col = max(0, min(7, int(px * 8 / w)))
+        row = max(0, min(7, int(py * 8 / h)))
+        if self.human_color == chess.WHITE:
+            file_, rank_ = col, 7 - row
+        else:
+            file_, rank_ = 7 - col, row
+        return chess.square(file_, rank_)
 
 
-def ai_make_move(board, temperature=1.0):
-    """Wrapper function that calls appropriate AI based on ai_type."""
-    if ai_type == 'neural':
-        ai_make_move_neural(board, temperature)
-    elif ai_type == 'simple':
-        ai_make_move_simple(board)
+# ── AI Worker Thread ──────────────────────────────────────────────────────────
+
+class AIWorker(QThread):
+    """
+    Runs MCTS in a background thread so the UI never freezes.
+
+    Signals
+    -------
+    progress(list)       — emitted periodically during neural search;
+                           each item: {"uci": str, "visits": int, "pct": float}
+    move_ready(object)   — emitted once with the chosen chess.Move (or None)
+    """
+
+    progress   = Signal(list)
+    move_ready = Signal(object)
+
+    def __init__(
+        self,
+        board:              chess.Board,
+        ai_type:            str,
+        model_state_dict:   Optional[dict] = None,
+        mcts_simple_agent:  Optional[MCTS_simple] = None,
+        num_sim:            int  = NUM_SIM_NEURAL,
+        leaf_batch:         int  = LEAF_BATCH,
+    ) -> None:
+        super().__init__()
+        self.board             = board.copy()
+        self.ai_type           = ai_type
+        self.model_state_dict  = model_state_dict
+        self.mcts_simple_agent = mcts_simple_agent
+        self.num_sim           = num_sim
+        self.leaf_batch        = leaf_batch
+        self._cancel           = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:
+        if self.ai_type == "neural":
+            self._run_neural()
+        else:
+            self._run_simple()
+
+    # ── Neural ────────────────────────────────────────────────────────────────
+
+    def _run_neural(self) -> None:
+        agent = MCTS(
+            num_simulations = self.num_sim,
+            leaf_batch_size = self.leaf_batch,
+            buffer_size     = 1,
+        )
+        if self.model_state_dict:
+            agent.model.load_state_dict(self.model_state_dict)
+        agent.model.eval()
+
+        state = ChessEnv.encode_state(self.board)
+        root  = Node(state, self.board.copy())
+
+        n_batches    = self.num_sim // self.leaf_batch
+        report_every = max(1, n_batches // 10)   # ~10 progress signals total
+
+        for i in range(n_batches):
+            if self._cancel:
+                return
+            agent.run_simulation_batch(root)
+            if (i + 1) % report_every == 0:
+                self.progress.emit(get_top_moves(root, self.board))
+
+        if self._cancel:
+            return
+
+        if np.sum(root.N) == 0:
+            legal = list(self.board.legal_moves)
+            self.move_ready.emit(random.choice(legal) if legal else None)
+            return
+
+        action_idx = int(np.argmax(root.N))
+        b = self.board.copy()
+        valid, move = ChessEnv.apply_action(action_idx, b)
+
+        # Final update so UI shows settled probabilities
+        self.progress.emit(get_top_moves(root, self.board))
+        self.move_ready.emit(move if valid else (
+            random.choice(list(self.board.legal_moves))
+            if self.board.legal_moves else None
+        ))
+
+    # ── Simple ────────────────────────────────────────────────────────────────
+
+    def _run_simple(self) -> None:
+        move = self.mcts_simple_agent.best_move(self.board)
+        if not self._cancel:
+            self.move_ready.emit(move)
 
 
-def get_game_status(board):
-    """Get current game status message."""
-    if board.is_checkmate():
-        winner = "Black" if board.turn == chess.WHITE else "White"
-        return f"Checkmate! {winner} wins!"
-    elif board.is_stalemate():
-        return "Stalemate!"
-    elif board.is_check():
-        return "Check!"
-    elif board.is_game_over():
-        return "Game Over - Draw"
-    else:
-        turn = "White" if board.turn == chess.WHITE else "Black"
-        return f"{turn} to move"
+# ── Setup Dialog ──────────────────────────────────────────────────────────────
+
+class SetupDialog(QDialog):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Chess RL")
+        self.setModal(True)
+        self.setMinimumWidth(340)
+
+        self.ai_type:     str          = "neural"
+        self.human_color: chess.Color  = chess.WHITE
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(28, 24, 28, 24)
+
+        # Title
+        lbl_title = QLabel("Chess RL")
+        lbl_title.setFont(QFont("Arial", 22, QFont.Bold))
+        lbl_title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl_title)
+
+        lbl_sub = QLabel("AlphaZero-style reinforcement learning")
+        lbl_sub.setFont(QFont("Arial", 9))
+        lbl_sub.setAlignment(Qt.AlignCenter)
+        lbl_sub.setStyleSheet("color:#888;")
+        layout.addWidget(lbl_sub)
+
+        # Opponent type
+        ai_box    = QGroupBox("Opponent")
+        ai_layout = QVBoxLayout(ai_box)
+        self.radio_neural = QRadioButton("Neural MCTS  (uses trained model)")
+        self.radio_simple = QRadioButton("Simple MCTS  (pure tree search)")
+        self.radio_neural.setChecked(True)
+        ai_layout.addWidget(self.radio_neural)
+        ai_layout.addWidget(self.radio_simple)
+        layout.addWidget(ai_box)
+
+        # Colour choice
+        color_box    = QGroupBox("Play as")
+        color_layout = QHBoxLayout(color_box)
+        self.radio_white = QRadioButton("White")
+        self.radio_black = QRadioButton("Black")
+        self.radio_white.setChecked(True)
+        color_layout.addWidget(self.radio_white)
+        color_layout.addWidget(self.radio_black)
+        layout.addWidget(color_box)
+
+        btn = QPushButton("Start Game")
+        btn.setFont(QFont("Arial", 11))
+        btn.setFixedHeight(38)
+        btn.clicked.connect(self._on_start)
+        layout.addWidget(btn)
+
+    def _on_start(self) -> None:
+        self.ai_type     = "neural" if self.radio_neural.isChecked() else "simple"
+        self.human_color = chess.WHITE if self.radio_white.isChecked() else chess.BLACK
+        self.accept()
 
 
-# Draw board and pieces
-def render(board):
-    colors = [(240, 217, 181), (181, 136, 99)]
+# ── Main Window ───────────────────────────────────────────────────────────────
 
-    for rank in range(8):
-        for file in range(8):
-            color = colors[(rank + file) % 2]
-            pygame.draw.rect(
-                win,
-                color,
-                pygame.Rect(
-                    file * square_size,
-                    (7 - rank) * square_size,
-                    square_size,
-                    square_size,
-                ),
+class MainWindow(QMainWindow):
+    def __init__(self, ai_type: str, human_color: chess.Color) -> None:
+        super().__init__()
+        self.ai_type     = ai_type
+        self.human_color = human_color
+        self.board       = chess.Board()
+        self.ai_worker:  Optional[AIWorker] = None
+
+        self.mcts_agent:   Optional[MCTS]        = None
+        self.simple_agent: Optional[MCTS_simple] = None
+        self._model_info   = self._init_ai()
+        self._init_ui()
+
+        # If human plays black the AI must move first — defer until window is shown
+        QTimer.singleShot(200, self._maybe_trigger_ai)
+
+    # ── Initialisation ────────────────────────────────────────────────────────
+
+    def _init_ai(self) -> str:
+        if self.ai_type == "neural":
+            self.mcts_agent = MCTS(
+                buffer_size     = 1,
+                num_simulations = NUM_SIM_NEURAL,
+                leaf_batch_size = LEAF_BATCH,
+            )
+            fname = load_latest_model(self.mcts_agent)
+            return f"Loaded {fname}" if fname else "No checkpoint found — untrained model"
+        else:
+            self.simple_agent = MCTS_simple(num_simulations=NUM_SIM_SIMPLE)
+            return f"Simple MCTS  ({NUM_SIM_SIMPLE:,} simulations)"
+
+    def _init_ui(self) -> None:
+        self.setWindowTitle("Chess RL")
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QHBoxLayout(central)
+        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+
+        # ── Left column: eval bar + board ────────────────────────────────────
+        left = QHBoxLayout()
+        left.setSpacing(6)
+
+        self.eval_bar = EvalBar()
+        left.addWidget(self.eval_bar)
+
+        self.board_wgt = ChessBoardWidget(self.human_color)
+        self.board_wgt.human_move.connect(self._on_human_move)
+        left.addWidget(self.board_wgt)
+
+        root_layout.addLayout(left)
+
+        # ── Right column: info panel ──────────────────────────────────────────
+        panel = QWidget()
+        panel.setFixedWidth(235)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setSpacing(8)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Status group
+        status_box    = QGroupBox("Game Status")
+        status_layout = QVBoxLayout(status_box)
+        status_layout.setSpacing(4)
+
+        self.lbl_status = QLabel("White to move")
+        self.lbl_status.setFont(QFont("Arial", 11, QFont.Bold))
+        self.lbl_status.setWordWrap(True)
+
+        color_str = "White ♔" if self.human_color == chess.WHITE else "Black ♚"
+        self.lbl_color = QLabel(f"You: {color_str}")
+        self.lbl_color.setFont(QFont("Arial", 9))
+
+        self.lbl_ai = QLabel(f"AI:  {self.ai_type.capitalize()} MCTS")
+        self.lbl_ai.setFont(QFont("Arial", 9))
+
+        self.lbl_model = QLabel(self._model_info)
+        self.lbl_model.setFont(QFont("Arial", 8))
+        self.lbl_model.setWordWrap(True)
+        self.lbl_model.setStyleSheet("color:#666;")
+
+        status_layout.addWidget(self.lbl_status)
+        status_layout.addWidget(self.lbl_color)
+        status_layout.addWidget(self.lbl_ai)
+        status_layout.addWidget(self.lbl_model)
+        panel_layout.addWidget(status_box)
+
+        # Thinking indicator
+        self.lbl_thinking = QLabel("")
+        self.lbl_thinking.setFont(QFont("Arial", 9))
+        self.lbl_thinking.setStyleSheet("color:#555; font-style:italic;")
+        self.lbl_thinking.setAlignment(Qt.AlignCenter)
+        panel_layout.addWidget(self.lbl_thinking)
+
+        # Move probability panel (only meaningful for neural MCTS)
+        self.move_prob = MoveProbPanel()
+        panel_layout.addWidget(self.move_prob)
+
+        panel_layout.addStretch()
+
+        # Controls
+        ctrl_box    = QGroupBox("Controls")
+        ctrl_layout = QVBoxLayout(ctrl_box)
+        btn_new     = QPushButton("New Game  [R]")
+        btn_new.clicked.connect(self.reset_game)
+        ctrl_layout.addWidget(btn_new)
+        panel_layout.addWidget(ctrl_box)
+
+        root_layout.addWidget(panel)
+        self.adjustSize()
+
+    # ── Game logic ────────────────────────────────────────────────────────────
+
+    def _on_human_move(self, move: chess.Move) -> None:
+        self.board_wgt.arrows = []          # clear any AI arrows from previous turn
+        self.board.push(move)
+        self.board_wgt.board     = self.board
+        self.board_wgt.last_move = move
+        self.board_wgt.update_board()
+        self._update_eval()
+        self._update_status()
+        if not self.board.is_game_over():
+            self._trigger_ai()
+
+    def _maybe_trigger_ai(self) -> None:
+        """Trigger AI if it is its turn (e.g. human plays black at game start)."""
+        if self.board.turn != self.human_color and not self.board.is_game_over():
+            self._trigger_ai()
+
+    def _trigger_ai(self) -> None:
+        if self.ai_worker and self.ai_worker.isRunning():
+            return
+        self.board_wgt.interactive = False
+        self.lbl_thinking.setText("Thinking…")
+        self.move_prob.clear()
+
+        if self.ai_type == "neural":
+            # Pass a CPU snapshot of the weights — safe to read from any thread
+            sd = {k: v.cpu() for k, v in self.mcts_agent.model.state_dict().items()}
+            self.ai_worker = AIWorker(
+                board            = self.board,
+                ai_type          = "neural",
+                model_state_dict = sd,
+                num_sim          = NUM_SIM_NEURAL,
+                leaf_batch       = LEAF_BATCH,
+            )
+        else:
+            self.ai_worker = AIWorker(
+                board             = self.board,
+                ai_type           = "simple",
+                mcts_simple_agent = self.simple_agent,
+                num_sim           = NUM_SIM_SIMPLE,
             )
 
-            square = chess.square(file, rank)
-            piece = board.piece_at(square)
+        self.ai_worker.progress.connect(self._on_ai_progress)
+        self.ai_worker.move_ready.connect(self._on_ai_move)
+        # _on_worker_done is called only after the thread has fully stopped,
+        # so it is safe to drop the Python reference there.
+        self.ai_worker.finished.connect(self._on_worker_done)
+        self.ai_worker.start()
 
-            if piece:
-                symbol = piece.symbol()
-                win.blit(
-                    pieces[symbol],
-                    (file * square_size, (7 - rank) * square_size),
+    def _on_ai_progress(self, top_moves: list) -> None:
+        """Called periodically while the neural AI is thinking."""
+        self.move_prob.update_moves(top_moves)
+
+        # Overlay top-3 moves as arrows on the board (green / orange / blue)
+        arrow_colors = ["#15781B", "#B7450A", "#0044cc"]
+        arrows = []
+        for i, m in enumerate(top_moves[:3]):
+            try:
+                mv = chess.Move.from_uci(m["uci"])
+                arrows.append(
+                    chess.svg.Arrow(mv.from_square, mv.to_square, color=arrow_colors[i])
                 )
+            except Exception:
+                pass
+        self.board_wgt.arrows = arrows
+        self.board_wgt.update_board()
 
-    # Display game status
-    font = pygame.font.Font(None, 24)
-    status_text = font.render(get_game_status(board), True, (0, 0, 0))
-    message_text = font.render(message, True, (50, 50, 150))
-    color_text = font.render(
-        f"You are playing as {'White' if human_color == chess.WHITE else 'Black'}",
-        True,
-        (0, 100, 0)
-    )
+    def _on_worker_done(self) -> None:
+        """Called by the finished signal — the thread has fully stopped here."""
+        self.ai_worker = None
 
-    pygame.draw.rect(win, (200, 200, 200), (0, 0, display_size, 60))
-    win.blit(status_text, (10, 5))
-    win.blit(color_text, (10, 25))
-    win.blit(message_text, (300, 15))
+    def _on_ai_move(self, move: Optional[chess.Move]) -> None:
+        self.board_wgt.interactive = True
+        self.lbl_thinking.setText("")
+        self.board_wgt.arrows = []
+        # Do NOT null ai_worker here: the thread may still be in Qt's cleanup
+        # phase.  _on_worker_done (connected to finished) handles that.
 
-    pygame.display.update()
+        if move is None or move not in self.board.legal_moves:
+            # Fallback: should rarely happen
+            legal = list(self.board.legal_moves)
+            if not legal:
+                self._update_status()
+                return
+            move = random.choice(legal)
+
+        self.board.push(move)
+        self.board_wgt.board     = self.board
+        self.board_wgt.last_move = move
+        self.board_wgt.update_board()
+        self._update_eval()
+        self._update_status()
+
+    # ── UI updates ────────────────────────────────────────────────────────────
+
+    def _update_eval(self) -> None:
+        if self.board.is_game_over():
+            res = self.board.result()
+            self.eval_bar.set_value(1.0 if res == "1-0" else -1.0 if res == "0-1" else 0.0)
+        else:
+            self.eval_bar.set_value(ChessEnv.get_potential(self.board))
+
+    def _update_status(self) -> None:
+        b = self.board
+        if b.is_checkmate():
+            winner = "Black" if b.turn == chess.WHITE else "White"
+            self.lbl_status.setText(f"Checkmate — {winner} wins!")
+            self.lbl_status.setStyleSheet("color:#c0392b; font-weight:bold;")
+        elif b.is_stalemate():
+            self.lbl_status.setText("Stalemate — Draw")
+            self.lbl_status.setStyleSheet("color:#7f8c8d;")
+        elif b.is_insufficient_material():
+            self.lbl_status.setText("Insufficient material — Draw")
+            self.lbl_status.setStyleSheet("color:#7f8c8d;")
+        elif b.is_seventyfive_moves():
+            self.lbl_status.setText("75-move rule — Draw")
+            self.lbl_status.setStyleSheet("color:#7f8c8d;")
+        elif b.is_fivefold_repetition():
+            self.lbl_status.setText("Fivefold repetition — Draw")
+            self.lbl_status.setStyleSheet("color:#7f8c8d;")
+        elif b.is_game_over():
+            self.lbl_status.setText("Game Over — Draw")
+            self.lbl_status.setStyleSheet("color:#7f8c8d;")
+        elif b.is_check():
+            turn = "White" if b.turn == chess.WHITE else "Black"
+            self.lbl_status.setText(f"Check! — {turn} to move")
+            self.lbl_status.setStyleSheet("color:#e67e22; font-weight:bold;")
+        else:
+            turn = "White" if b.turn == chess.WHITE else "Black"
+            self.lbl_status.setText(f"{turn} to move")
+            self.lbl_status.setStyleSheet("")
+
+    # ── Reset ─────────────────────────────────────────────────────────────────
+
+    def reset_game(self) -> None:
+        if self.ai_worker and self.ai_worker.isRunning():
+            self.ai_worker.cancel()
+            if not self.ai_worker.wait(2000):
+                self.ai_worker.terminate()
+                self.ai_worker.wait()
+        if self.ai_worker:
+            # Block any queued move_ready / progress signals so they cannot
+            # fire against the new board after the reset.
+            self.ai_worker.blockSignals(True)
+        self.ai_worker = None
+
+        self.board                 = chess.Board()
+        self.board_wgt.board       = self.board
+        self.board_wgt.last_move   = None
+        self.board_wgt.selected_sq = None
+        self.board_wgt.legal_dests = set()
+        self.board_wgt.arrows      = []
+        self.board_wgt.interactive = True
+        self.board_wgt.update_board()
+        self.move_prob.clear()
+        self.lbl_thinking.setText("")
+        self.lbl_status.setStyleSheet("")
+        self.eval_bar.set_value(0.0)
+        self._update_status()
+        QTimer.singleShot(100, self._maybe_trigger_ai)
+
+    # ── Keyboard shortcuts ────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event) -> None:
+        if   event.key() == Qt.Key_R:      self.reset_game()
+        elif event.key() == Qt.Key_Escape: self.close()
+
+    def closeEvent(self, event) -> None:
+        if self.ai_worker and self.ai_worker.isRunning():
+            self.ai_worker.cancel()
+            if not self.ai_worker.wait(2000):
+                self.ai_worker.terminate()
+                self.ai_worker.wait()
+        event.accept()
 
 
-# Handle move dragging
-def handle_move(board):
-    mouse_down = True
-    start_pos = pygame.mouse.get_pos()
-    from_sq = get_square_from_mouse(start_pos)
+# ── Entry Point ───────────────────────────────────────────────────────────────
 
-    piece = board.piece_at(from_sq)
-    if piece is None or piece.color != board.turn:
-        return False
+def main() -> None:
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")      # consistent look across Windows / macOS / Linux
 
-    legal_moves = [
-        move for move in board.legal_moves if move.from_square == from_sq
-    ]
+    dialog = SetupDialog()
+    if dialog.exec() != QDialog.Accepted:
+        sys.exit(0)
 
-    while mouse_down:
-        pygame.event.pump()
-        mouse_down = pygame.mouse.get_pressed()[0]
-        mouse_pos = pygame.mouse.get_pos()
-
-        render(board)
-
-        # Draw legal move indicators
-        for move in legal_moves:
-            to_sq = move.to_square
-            file = chess.square_file(to_sq)
-            rank = chess.square_rank(to_sq)
-            pygame.draw.circle(
-                win,
-                (0, 255, 0),
-                (
-                    file * square_size + square_size // 2,
-                    (7 - rank) * square_size + square_size // 2,
-                ),
-                10,
-            )
-
-        # Draw dragged piece
-        if piece:
-            win.blit(
-                pieces[piece.symbol()],
-                (mouse_pos[0] - square_size // 2, mouse_pos[1] - square_size // 2),
-            )
-
-        pygame.display.update()
-
-    # Determine destination when mouse released
-    end_pos = pygame.mouse.get_pos()
-    to_sq = get_square_from_mouse(end_pos)
-
-    move = chess.Move(from_sq, to_sq)
-
-    # Handle promotion automatically (queen)
-    if move in board.legal_moves:
-        board.push(move)
-        return True
-    else:
-        # try promotion
-        move = chess.Move(from_sq, to_sq, promotion=chess.QUEEN)
-        if move in board.legal_moves:
-            board.push(move)
-            return True
-    
-    return False
+    window = MainWindow(dialog.ai_type, dialog.human_color)
+    window.show()
+    sys.exit(app.exec())
 
 
-# MAIN LOOP
 if __name__ == "__main__":
-    # AI Type selection
-    ai_type_selected = False
-    while not ai_type_selected:
-        draw_ai_type_menu()
-        
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_n:
-                    ai_type = 'neural'
-                    ai_type_selected = True
-                elif event.key == pygame.K_s:
-                    ai_type = 'simple'
-                    ai_type_selected = True
-    
-    # Color selection
-    color_selected = False
-    while not color_selected:
-        draw_color_menu()
-        
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_w:
-                    human_color = chess.WHITE
-                    color_selected = True
-                elif event.key == pygame.K_b:
-                    human_color = chess.BLACK
-                    color_selected = True
-    
-    # Initialize game and AI
-    initialize_game()
-    
-    board = chess.Board(START_FEN)
-    
-    clock = pygame.time.Clock()
-    
-    while True:
-        clock.tick(30)  # 30 FPS
-        
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit()
-                sys.exit()
-
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                # Only handle moves for human player
-                if board.turn == human_color and not board.is_game_over():
-                    if handle_move(board):
-                        message = "Your move played"
-
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_r:
-                    # Reset game
-                    board = chess.Board("8/2ppk3/8/8/8/8/PPP1K3/8 w - - 0 1")
-                    message = "Game reset"
-                if event.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    sys.exit()
-
-        # AI makes move if it's AI's turn and game is not over
-        if board.turn != human_color and not board.is_game_over():
-            ai_make_move(board)
-
-        render(board)
+    main()
