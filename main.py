@@ -685,7 +685,7 @@ class MainWindow(QMainWindow):
             res = self.board.result()
             self.eval_bar.set_value(1.0 if res == "1-0" else -1.0 if res == "0-1" else 0.0)
         else:
-            self.eval_bar.set_value(ChessEnv.get_potential(self.board))
+            self.eval_bar.set_value(ChessEnv.get_evaluation(self.board))
 
     def _update_status(self) -> None:
         b = self.board
