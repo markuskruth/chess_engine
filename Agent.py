@@ -5,14 +5,18 @@ import numpy as np
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
 from utils import ReplayBuffer
+from data_loader import load_binary_game_data
 import chess
 import csv
 import random
+import subprocess
+import sys
 from collections import deque
 import multiprocessing as mp
 import os
 import time
 import threading
+import gc
 
 
 class Node:
@@ -684,6 +688,285 @@ def run_training_parallel(
     print("Training Complete!")
     print("="*50)
 
+def run_training_parallel_hybrid(
+    episodes,
+    selfplay_exe="build/Release/selfplay.exe",
+    num_workers=4,
+    games_per_episode=20,
+    batch_size=256,
+    num_simulations=400,
+    leaf_batch_size=8,
+    max_moves=200,
+    train_batches=100,
+    temperature=1.0,
+    keep_game_files=False,
+):
+    """
+    Hybrid training loop: C++ handles self-play, Python handles training.
+
+    Each episode:
+      1. Export current model weights as a TorchScript file.
+      2. Invoke the C++ selfplay binary as a subprocess (blocking).
+      3. Load the binary game data into the replay buffer.
+      4. Train the network on GPU for train_batches gradient steps.
+      5. Checkpoint and repeat.
+
+    Parameters
+    ----------
+    selfplay_exe   : path to the compiled selfplay executable
+    num_workers    : parallel game threads passed to C++ (--workers)
+    games_per_episode : total games per episode
+    keep_game_files   : if False, delete the .bin file after loading
+    """
+    print("Initializing Hybrid C++/Python Training...")
+    mcts = MCTS(
+        buffer_size=100000,
+        batch_size=batch_size,
+        num_simulations=num_simulations,
+        leaf_batch_size=leaf_batch_size,
+    )
+
+    # ── Resume ────────────────────────────────────────────────────────────────
+    start_ep = 0
+    if os.path.exists("checkpoint_latest.pt"):
+        print("Found checkpoint_latest.pt — resuming...")
+        ckpt = torch.load("checkpoint_latest.pt", map_location=mcts.device)
+        mcts.model.load_state_dict(ckpt["model"])
+        mcts.optimizer.load_state_dict(ckpt["optimizer"])
+        mcts.scheduler.load_state_dict(ckpt["scheduler"])
+        mcts.scaler.load_state_dict(ckpt["scaler"])
+        start_ep = ckpt["episode"] + 1
+        print(f"  Resumed from episode {ckpt['episode'] + 1}")
+
+        if os.path.exists("buffer_latest.npz"):
+            try:
+                data = np.load("buffer_latest.npz")
+                n = int(data["size"])
+                mcts.memory.states[:n]   = data["states"]
+                mcts.memory.policies[:n] = data["policies"]
+                mcts.memory.values[:n]   = data["values"]
+                mcts.memory.index        = int(data["index"])
+                mcts.memory.size         = n
+                print(f"  Replay buffer restored: {n} positions")
+            except Exception as e:
+                print(f"  WARNING: buffer_latest.npz corrupt ({e}), starting empty")
+
+    print(f"Device (training): {mcts.device}")
+    print(f"Workers: {num_workers}  |  Games/episode: {games_per_episode}")
+    print(f"Simulations/position: {num_simulations}  |  Batch size: {batch_size}\n")
+
+    # ── Eval log ──────────────────────────────────────────────────────────────
+    eval_log_path = "eval_log.csv"
+    eval_interval = 5
+    if not os.path.exists(eval_log_path):
+        with open(eval_log_path, "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["episode", "win_rate", "draw_rate", "loss_rate",
+                 "value_loss", "policy_loss"]
+            )
+
+    def fmt_time(seconds):
+        seconds = int(seconds)
+        h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+        if h > 0:   return f"{h}h {m:02d}m {s:02d}s"
+        if m > 0:   return f"{m}m {s:02d}s"
+        return f"{s}s"
+
+    episode_times = []
+    save_thread   = None
+
+    for ep in range(start_ep, episodes):
+        ep_start = time.time()
+        print(f"\n{'─' * 56}")
+        print(f"Episode {ep + 1}/{episodes}")
+
+        # ── 1. Export TorchScript model ───────────────────────────────────────
+        model_file = "model_current.pt"
+        # Move model to CPU for a clean, context-free export
+        mcts.model.eval()
+        cpu_model = mcts.model.to("cpu")
+        sample_input = torch.randn(1, 20, 8, 8).to("cpu")
+        
+        with torch.no_grad():
+            traced = torch.jit.trace(cpu_model, sample_input)
+        traced.save(model_file)
+        
+        # Move model back to GPU so Python can use it later
+        mcts.model.to(mcts.device)
+
+        # Force Python to release all unused GPU memory BEFORE C++ starts
+        gc.collect()
+        if mcts.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        game_file = f"games_ep{ep}.bin"
+        cmd = [
+            selfplay_exe,
+            model_file,
+            "--games",   str(games_per_episode),
+            "--workers", str(num_workers),
+            "--sims",    str(num_simulations),
+            "--batch",   str(leaf_batch_size),
+            "--moves",   str(max_moves),
+            "--temp",    str(temperature),
+            "--output",  game_file,
+        ]
+
+        # ── 2. C++ self-play subprocess ───────────────────────────────────────
+        game_file = f"games_ep{ep}.bin"
+        cmd = [
+            selfplay_exe,
+            model_file,
+            "--games",   str(games_per_episode),
+            "--workers", str(num_workers),
+            "--sims",    str(num_simulations),
+            "--batch",   str(leaf_batch_size),
+            "--moves",   str(max_moves),
+            "--temp",    str(temperature),
+            "--output",  game_file,
+        ]
+
+        sp_start = time.time()
+        print(f"  Self-play  running C++ ({games_per_episode} games, "
+              f"{num_workers} workers)...", end="", flush=True)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=None,   # inherit: debug output goes directly to terminal
+                text=True,
+            )
+        except FileNotFoundError:
+            print(f"\n  [ERROR] selfplay executable not found: {selfplay_exe}")
+            print(f"  Build with: cmake --build build --config Release")
+            sys.exit(1)
+        try:
+            stdout_data, _ = proc.communicate()
+        except (KeyboardInterrupt, SystemExit):
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise
+        if proc.returncode != 0:
+            print(f"\n  [ERROR] selfplay exited with code {proc.returncode}")
+            sys.exit(1)
+        result = subprocess.CompletedProcess(cmd, proc.returncode, stdout_data, "")
+        sp_time = time.time() - sp_start
+        print(f"\r  Self-play  done in {fmt_time(sp_time)}")
+
+        # Print C++ summary lines (lines starting with spaces or '──')
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("──") or stripped.startswith("White") \
+                    or stripped.startswith("Black") or stripped.startswith("Draw") \
+                    or stripped.startswith("Avg") or stripped.startswith("Games") \
+                    or stripped.startswith("Move"):
+                print(f"    {stripped}")
+
+        # ── 3. Load binary data into replay buffer ────────────────────────────
+        if os.path.exists(game_file):
+            # Ensure previous buffer-save thread is done before modifying buffer
+            if save_thread is not None:
+                save_thread.join()
+
+            states, policies, values = load_binary_game_data(game_file)
+            mcts.memory.add_batch(states, policies, values)
+            total_positions = len(states)
+            print(f"  Loaded     {total_positions} positions from {game_file}")
+
+            if not keep_game_files:
+                os.remove(game_file)
+        else:
+            print(f"  WARNING: {game_file} not found — skipping data load")
+            total_positions = 0
+
+        # ── 4. Train on GPU ───────────────────────────────────────────────────
+        tr_start = time.time()
+        losses = {}
+        if len(mcts.memory) >= batch_size:
+            mcts.model.train() # Switch model to train mode
+            losses = mcts.train_network(num_batches=train_batches)
+            tr_time = time.time() - tr_start
+            print(f"  Training   {train_batches} batches | "
+                  f"val {losses['value_loss']:.4f}  "
+                  f"pol {losses['policy_loss']:.4f}  "
+                  f"total {losses['total_loss']:.4f} | {fmt_time(tr_time)}")
+        else:
+            print(f"  Training   skipped (buffer {len(mcts.memory)} < batch {batch_size})")
+
+        # ── 5. LR schedule ────────────────────────────────────────────────────
+        mcts.scheduler.step()
+        current_lr = mcts.optimizer.param_groups[0]["lr"]
+        buf_pct    = len(mcts.memory) / mcts.memory.capacity * 100
+        print(f"  Buffer     {len(mcts.memory):,} / {mcts.memory.capacity:,} "
+              f"({buf_pct:.1f}%)  LR {current_lr:.6f}")
+
+        # ── 6. ETA ────────────────────────────────────────────────────────────
+        ep_time = time.time() - ep_start
+        episode_times.append(ep_time)
+        avg_ep_time    = sum(episode_times[-20:]) / len(episode_times[-20:])
+        remaining_eps  = episodes - (ep + 1)
+        eta            = avg_ep_time * remaining_eps
+        print(f"  Episode time: {fmt_time(ep_time)}  |  ETA: {fmt_time(eta)}")
+
+        # ── 7. Checkpoint ─────────────────────────────────────────────────────
+        torch.save({
+            "episode":   ep,
+            "model":     mcts.model.state_dict(),
+            "optimizer": mcts.optimizer.state_dict(),
+            "scheduler": mcts.scheduler.state_dict(),
+            "scaler":    mcts.scaler.state_dict(),
+        }, "checkpoint_latest.pt")
+
+        n = mcts.memory.size
+        save_thread = threading.Thread(
+            target=_save_buffer_bg,
+            args=(
+                mcts.memory.states[:n],
+                mcts.memory.policies[:n],
+                mcts.memory.values[:n],
+                mcts.memory.index,
+                n,
+                "buffer_latest.npz",
+            ),
+            daemon=True,
+        )
+        save_thread.start()
+        print(f"  Checkpoint saved (ep {ep + 1})")
+
+        if (ep + 1) % 10 == 0:
+            torch.save(mcts.model.state_dict(), f"model_ep{ep + 1}.pt")
+            print(f"  Milestone: model_ep{ep + 1}.pt")
+
+        # ── 8. Evaluation vs random ───────────────────────────────────────────
+        if (ep + 1) % eval_interval == 0:
+            ev_start = time.time()
+            win_r, draw_r, loss_r = mcts.evaluate_vs_random(
+                num_games=20, num_simulations=100
+            )
+            ev_time  = time.time() - ev_start
+            val_loss = losses.get("value_loss",  float("nan"))
+            pol_loss = losses.get("policy_loss", float("nan"))
+            with open(eval_log_path, "a", newline="") as f:
+                csv.writer(f).writerow([
+                    ep + 1, f"{win_r:.3f}", f"{draw_r:.3f}", f"{loss_r:.3f}",
+                    f"{val_loss:.4f}", f"{pol_loss:.4f}",
+                ])
+            print(f"  Eval vs random  "
+                  f"W {win_r*100:.0f}%  D {draw_r*100:.0f}%  L {loss_r*100:.0f}%"
+                  f"  | {fmt_time(ev_time)}")
+
+    if save_thread is not None:
+        save_thread.join()
+
+    print("\n" + "=" * 50)
+    print("Training Complete!")
+    print("=" * 50)
+
+
 def run_benchmark(model_path="checkpoint_latest.pt", num_games=20, num_simulations=100, leaf_batch_size=8):
     if not os.path.exists(model_path):
         print(f"Error: Could not find model file at '{model_path}'")
@@ -749,22 +1032,31 @@ if __name__ == "__main__":
     # Required on Windows: multiprocessing needs the 'spawn' guard
     mp.freeze_support()
 
-    episodes = 500
-    num_workers = 8          # 8 CPU workers; leaves 2 threads for OS + main process
-    games_per_worker = 3     # 24 games/episode
-    batch_size = 256
-    num_simulations = 400    # must be divisible by leaf_batch_size
-    leaf_batch_size = 8      # forward passes per MCTS step: 400/8 = 50 batched calls
-    max_moves = 200
-    train_batches = 100
-
-    run_training_parallel(
-        episodes=episodes,
-        num_workers=num_workers,
-        games_per_worker=games_per_worker,
-        batch_size=batch_size,
-        num_simulations=num_simulations,
-        max_moves=max_moves,
-        train_batches=train_batches,
-        leaf_batch_size=leaf_batch_size,
+    # ── Hybrid training (C++ self-play + Python training) ─────────────────────
+    # Requires a compiled selfplay.exe.  Build with:
+    #   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
+    run_training_parallel_hybrid(
+        episodes=500,
+        selfplay_exe="build/Release/selfplay.exe",
+        num_workers=8,           # parallel game threads in C++ (--workers)
+        games_per_episode=100,    # total games per episode
+        batch_size=256,
+        num_simulations=400,     # must be divisible by leaf_batch_size
+        leaf_batch_size=16,      # larger batch → bigger GPU batches → higher utilization
+        max_moves=200,
+        train_batches=100,
+        temperature=1.0,
+        keep_game_files=False,   # delete .bin files after loading
     )
+
+    # ── Pure-Python fallback (uncomment to use instead) ───────────────────────
+    # run_training_parallel(
+    #     episodes=500,
+    #     num_workers=8,
+    #     games_per_worker=3,
+    #     batch_size=256,
+    #     num_simulations=400,
+    #     leaf_batch_size=8,
+    #     max_moves=200,
+    #     train_batches=100,
+    # )
