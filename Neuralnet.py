@@ -38,9 +38,7 @@ class CNNNet(nn.Module):
         )
 
         # POLICY HEAD
-        self.policy_conv = nn.Conv2d(channels, 32, kernel_size=1)
-        self.policy_bn = nn.BatchNorm2d(32)
-        self.policy_fc = nn.Linear(32 * 8 * 8, 8 * 8 * 73)
+        self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1)
 
         # VALUE HEAD
         self.value_conv = nn.Conv2d(channels, 16, kernel_size=1)
@@ -56,12 +54,9 @@ class CNNNet(nn.Module):
             x = block(x)
 
         # POLICY
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
-        p = p.view(p.size(0), -1)
-        p = self.policy_fc(p)
-
-        # reshape to (batch, 8, 8, 73)
-        p = p.view(-1, 8, 8, 73)
+        p = self.policy_conv(x)          # Shape: (batch, 73, 8, 8)
+        p = p.permute(0, 2, 3, 1)        # Shape: (batch, 8, 8, 73)
+        p = p.reshape(p.size(0), -1)     # Shape: (batch, 4672)
 
         # VALUE
         v = F.relu(self.value_bn(self.value_conv(x)))
