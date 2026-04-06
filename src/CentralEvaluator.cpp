@@ -1,6 +1,7 @@
 // CentralEvaluator.cpp — Phase 4 implementation
 
 #include "CentralEvaluator.h"
+#include <ATen/cuda/CUDAContext.h>
 #include <chrono>
 #include <cstring>  // memcpy
 #include <iostream>
@@ -34,16 +35,41 @@ void CentralEvaluator::join() {
 
 void CentralEvaluator::run() {
     try {
-        // Initialize here instead
-        // The GPU thread now securely owns the CUDA memory context
+        // GPU thread now owns the CUDA context — all model ops happen here.
         model_.to(device_);
         model_.eval();
 
-        int  batch_count   = 0;
+        // Disable cuDNN auto-benchmark: prevents cuDNN from hanging while it
+        // profiles kernel candidates for this input shape.
+        at::globalContext().setBenchmarkCuDNN(false);
+
+        // Pre-allocate fixed-size input tensors (reused every batch).
+        // Using pinned (page-locked) CPU memory for fast async DMA transfers.
+        const bool use_cuda = (device_.type() == torch::kCUDA);
+        states_cpu_ = torch::zeros(
+            {max_batch_, STATE_CHANNELS, BOARD_SZ, BOARD_SZ},
+            torch::TensorOptions().dtype(torch::kFloat32)
+                                  .pinned_memory(use_cuda));
+        states_gpu_ = torch::zeros(
+            {max_batch_, STATE_CHANNELS, BOARD_SZ, BOARD_SZ},
+            torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+
+        // Warmup: run one forward pass before the main loop so that cuDNN
+        // selects and caches its kernel implementation upfront.  This prevents
+        // the first real batch from paying a large latency spike.
+        {
+            torch::NoGradGuard no_grad;
+            model_.forward({states_gpu_});
+            if (use_cuda) {
+                c10::cuda::device_synchronize();
+            }
+        }
+
+        int  batch_count    = 0;
         auto last_heartbeat = std::chrono::steady_clock::now();
         auto last_forward   = std::chrono::steady_clock::now();
 
-        std::cerr << "[DEBUG evaluator] started, min_batch=" << min_batch_
+        std::cerr << "[DEBUG evaluator] started (warmup done), min_batch=" << min_batch_
                   << " max_batch=" << max_batch_ << "\n" << std::flush;
 
         while (queue_->wait_for_batch(min_batch_)) {
@@ -107,33 +133,37 @@ void CentralEvaluator::process_batch(std::vector<EvalRequest>& batch) {
     const int B = static_cast<int>(batch.size());
     constexpr int STATE_FLOATS = STATE_CHANNELS * BOARD_SZ * BOARD_SZ;  // 1280
 
-    // 1. ALWAYS allocate a tensor of size max_batch_ to prevent cuDNN deadlocks
-    auto states = torch::zeros({max_batch_, STATE_CHANNELS, BOARD_SZ, BOARD_SZ},
-                               torch::kFloat32);
-                               
-    float* dst = states.data_ptr<float>();
+    // 1. Fill the pre-allocated pinned CPU buffer (zero tail to keep shape fixed).
+    float* dst = states_cpu_.data_ptr<float>();
+    // Fill valid entries; zero the tail so the GPU always sees the same shape.
     for (int i = 0; i < B; ++i) {
         std::memcpy(dst + i * STATE_FLOATS,
                     batch[i].state.data(),
                     STATE_FLOATS * sizeof(float));
     }
-    states = states.to(device_);
+    if (B < max_batch_) {
+        std::memset(dst + B * STATE_FLOATS, 0,
+                    (max_batch_ - B) * STATE_FLOATS * sizeof(float));
+    }
 
-    // 2. Forward pass — the shape {max_batch_, 20, 8, 8} NEVER changes.
+    // 2. Async DMA from pinned CPU → GPU (non-blocking; CUDA stream ensures
+    //    the copy completes before the forward pass uses the data).
+    states_gpu_.copy_(states_cpu_, /*non_blocking=*/true);
+
+    // 3. Forward pass — shape {max_batch_, 20, 8, 8} NEVER changes.
     torch::Tensor p_batch, v_batch;
     {
         torch::NoGradGuard no_grad;
-        auto out = model_.forward({states}).toTuple();
-        
-        // Extract policy and slice only the first 'B' valid results
+        auto out = model_.forward({states_gpu_}).toTuple();
+
+        // Slice only the first B valid results before copying to CPU.
         p_batch = out->elements()[0].toTensor()
-                     .slice(0, 0, B) // <--- Slice here!
+                     .slice(0, 0, B)
                      .to(torch::kCPU).contiguous()
                      .reshape({B, ACTION_DIM});
-                     
-        // Extract value and slice only the first 'B' valid results
+
         v_batch = out->elements()[1].toTensor()
-                     .slice(0, 0, B) // <--- Slice here!
+                     .slice(0, 0, B)
                      .to(torch::kCPU).contiguous()
                      .reshape({B});
     }

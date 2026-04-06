@@ -153,15 +153,10 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature) {
             }
         }
 
-        // Encode and store state for this ply.
+        // Encode and store state for this ply (no torch allocation).
         {
-            constexpr int STATE_FLOATS = STATE_CHANNELS * BOARD_SZ * BOARD_SZ;
-            auto state_t = ChessEnv::encode_state(board)
-                               .to(torch::kCPU).contiguous();
             TrajEntry entry;
-            std::memcpy(entry.state.data(),
-                        state_t.data_ptr<float>(),
-                        STATE_FLOATS * sizeof(float));
+            ChessEnv::encode_state_into(board, entry.state.data());
             entry.pi   = pi;
             entry.turn = turn;
             traj.push_back(entry);

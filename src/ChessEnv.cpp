@@ -76,9 +76,9 @@ std::pair<bool, bool> ChessEnv::game_over(const chess::Board& board) {
 //   18:   half-move clock / 50.0
 //   19:   repetition count / 2.0  (0, 0.5, 1.0)
 
-torch::Tensor ChessEnv::encode_state(const chess::Board& board) {
-    auto state = torch::zeros({STATE_CHANNELS, BOARD_SZ, BOARD_SZ}, torch::kFloat32);
-    float* data = state.data_ptr<float>();
+void ChessEnv::encode_state_into(const chess::Board& board, float* data) {
+    constexpr int N = STATE_CHANNELS * BOARD_SZ * BOARD_SZ;
+    std::fill(data, data + N, 0.0f);
 
     const bool flip = (board.sideToMove() == chess::Color::BLACK);
 
@@ -148,7 +148,11 @@ torch::Tensor ChessEnv::encode_state(const chess::Board& board) {
     if (board.isRepetition(2)) rep = 0.5f;
     if (board.isRepetition(3)) rep = 1.0f;
     for (int i = 0; i < 64; ++i) data[19 * 64 + i] = rep;
+}
 
+torch::Tensor ChessEnv::encode_state(const chess::Board& board) {
+    auto state = torch::zeros({STATE_CHANNELS, BOARD_SZ, BOARD_SZ}, torch::kFloat32);
+    encode_state_into(board, state.data_ptr<float>());
     return state;
 }
 

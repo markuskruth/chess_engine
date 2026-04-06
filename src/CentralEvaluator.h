@@ -47,6 +47,11 @@ private:
     std::thread         thread_;
     std::atomic<bool>   running_{false};
 
+    // Pre-allocated input tensors (reused every batch to avoid per-call allocation).
+    // Initialized in run() after the CUDA context is set up.
+    torch::Tensor       states_cpu_;  // {max_batch_, 20, 8, 8} pinned CPU memory
+    torch::Tensor       states_gpu_;  // {max_batch_, 20, 8, 8} on device_
+
     void run();
     void process_batch(std::vector<EvalRequest>& batch);
 };

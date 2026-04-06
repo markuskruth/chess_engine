@@ -145,21 +145,16 @@ AsyncMCTS::select_and_submit(Node& root, int leaf_batch_size) {
     pending.paths.resize(leaf_batch_size);
     pending.futures.reserve(leaf_batch_size);
 
-    constexpr int STATE_FLOATS = STATE_CHANNELS * BOARD_SZ * BOARD_SZ;
-
     // Selection (with virtual loss applied per leaf).
     for (int i = 0; i < leaf_batch_size; ++i) {
         pending.leaves[i] = select(root, pending.paths[i]);
     }
 
     // Encode and push to queue — non-blocking.
+    // encode_state_into writes directly into req.state (no torch allocation).
     for (int i = 0; i < leaf_batch_size; ++i) {
         EvalRequest req;
-        auto state_t = ChessEnv::encode_state(pending.leaves[i]->board)
-                           .to(torch::kCPU).contiguous();
-        std::memcpy(req.state.data(),
-                    state_t.data_ptr<float>(),
-                    STATE_FLOATS * sizeof(float));
+        ChessEnv::encode_state_into(pending.leaves[i]->board, req.state.data());
         pending.futures.push_back(req.promise.get_future());
         queue_->push(std::move(req));
     }

@@ -61,6 +61,11 @@ namespace ChessEnv {
     //   19:   repetition count / 2.0  (0, 0.5 or 1.0)
     torch::Tensor encode_state(const chess::Board& board);
 
+    // Encode directly into a caller-supplied float buffer (STATE_CHANNELS*8*8 = 1280 floats).
+    // Avoids heap allocation — safe to call from any worker thread without touching
+    // PyTorch's global allocator or CUDA state.
+    void encode_state_into(const chess::Board& board, float* out);
+
     // Returns a flat bool[4672] mask of legal moves in the agent's action space.
     // Indexing: mask[row * COLS * ACTION_PLANES + col * ACTION_PLANES + plane]
     ActionMask get_action_mask(const chess::Board& board);
