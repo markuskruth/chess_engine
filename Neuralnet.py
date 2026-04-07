@@ -25,7 +25,7 @@ class ResidualBlock(nn.Module):
 
 
 class CNNNet(nn.Module):
-    def __init__(self, in_channels=20, channels=128, num_blocks=5):
+    def __init__(self, in_channels=20, channels=128, num_blocks=10):
         super().__init__()
 
         # Initial convolution
