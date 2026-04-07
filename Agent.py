@@ -942,6 +942,7 @@ def run_training_parallel_hybrid(
             print(f"  Milestone: model_ep{ep + 1}.pt")
 
         # ── 8. Evaluation vs random ───────────────────────────────────────────
+        """
         if (ep + 1) % eval_interval == 0:
             ev_start = time.time()
             win_r, draw_r, loss_r = mcts.evaluate_vs_random(
@@ -958,13 +959,14 @@ def run_training_parallel_hybrid(
             print(f"  Eval vs random  "
                   f"W {win_r*100:.0f}%  D {draw_r*100:.0f}%  L {loss_r*100:.0f}%"
                   f"  | {fmt_time(ev_time)}")
-
+        """
     if save_thread is not None:
         save_thread.join()
 
     print("\n" + "=" * 50)
     print("Training Complete!")
     print("=" * 50)
+
 
 
 def run_benchmark(model_path="checkpoint_latest.pt", num_games=20, num_simulations=100, leaf_batch_size=8):
@@ -1038,11 +1040,11 @@ if __name__ == "__main__":
     run_training_parallel_hybrid(
         episodes=500,
         selfplay_exe="build/Release/selfplay.exe",
-        num_workers=8,           # parallel game threads in C++ (--workers)
+        num_workers=10,           # parallel game threads in C++ (--workers) (n_of_cpu_threads - 2)
         games_per_episode=100,    # total games per episode
         batch_size=256,
-        num_simulations=400,     # must be divisible by leaf_batch_size
-        leaf_batch_size=16,      # larger batch → bigger GPU batches → higher utilization
+        num_simulations=448,     # must be divisible by leaf_batch_size
+        leaf_batch_size=64,      # larger batch → bigger GPU batches → higher utilization
         max_moves=200,
         train_batches=100,
         temperature=1.0,
