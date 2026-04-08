@@ -39,7 +39,7 @@ struct RunConfig {
     int   num_workers      = 1;
     int   num_simulations  = 400;
     int   leaf_batch_size  = 8;
-    int   max_moves        = 200;
+    int   max_moves        = 400;
     float temperature      = 1.0f;
 };
 

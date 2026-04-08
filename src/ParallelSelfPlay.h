@@ -20,7 +20,7 @@ struct ParallelSelfPlayConfig {
     int   num_workers      = 4;     // concurrent game threads
     int   num_simulations  = 400;   // MCTS simulations per position
     int   leaf_batch_size  = 8;     // leaves per run_simulation_batch call
-    int   max_moves        = 200;   // move limit per game
+    int   max_moves        = 400;   // move limit per game (plies; 400 = 200 full moves)
     float temperature         = 1.0f;
     float dirichlet_alpha     = 0.3f;   // Dir(α) concentration — 0.3 is standard for chess
     float dirichlet_epsilon   = 0.25f;  // noise fraction mixed into root prior

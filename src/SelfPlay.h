@@ -37,7 +37,7 @@ struct SelfPlayConfig {
     int num_games        = 10;
     int num_simulations  = 400;   // total sims per position (must be divisible by leaf_batch)
     int leaf_batch_size  = 8;
-    int max_moves        = 200;
+    int max_moves        = 400;   // plies; 400 = 200 full moves
     float temperature    = 1.0f;
     std::string model_path;       // path to TorchScript model file
     std::string output_path;      // path for binary game data output

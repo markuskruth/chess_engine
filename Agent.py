@@ -1178,7 +1178,7 @@ if __name__ == "__main__":
         batch_size=256,
         num_simulations=448,     # must be divisible by leaf_batch_size
         leaf_batch_size=64,      # larger batch → bigger GPU batches → higher utilization
-        max_moves=200,
+        max_moves=400,
         train_batches=100,
         temperature=1.0,
         keep_game_files=False,   # delete .bin files after loading
