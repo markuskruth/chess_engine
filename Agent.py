@@ -12,6 +12,7 @@ import random
 import subprocess
 import sys
 from collections import deque
+from datetime import datetime
 import multiprocessing as mp
 import os
 import time
@@ -807,6 +808,42 @@ def run_training_parallel_hybrid(
                  "value_loss", "policy_loss"]
             )
 
+    # ── Training log ──────────────────────────────────────────────────────────
+    train_log_path = "training_log.csv"
+    _TRAIN_LOG_HEADER = [
+        "timestamp", "episode", "games", "sims", "positions",
+        "selfplay_s", "train_s", "episode_s",
+        "value_loss", "policy_loss", "total_loss",
+        "buffer_size", "buffer_pct", "lr",
+        "white_pct", "black_pct", "draw_pct", "limit_pct", "avg_moves",
+    ]
+    if not os.path.exists(train_log_path):
+        with open(train_log_path, "w", newline="") as f:
+            csv.writer(f).writerow(_TRAIN_LOG_HEADER)
+
+    def _parse_selfplay_summary(stdout_text):
+        """Extract game outcome stats from the C++ selfplay summary block."""
+        stats = {
+            "white_pct": float("nan"), "black_pct": float("nan"),
+            "draw_pct":  float("nan"), "limit_pct": float("nan"),
+            "avg_moves": float("nan"),
+        }
+        for line in stdout_text.splitlines():
+            try:
+                if "Avg moves" in line:
+                    stats["avg_moves"] = float(line.split(":")[1].strip())
+                elif "White wins" in line:
+                    stats["white_pct"] = float(line.split("(")[1].split("%")[0].strip())
+                elif "Black wins" in line:
+                    stats["black_pct"] = float(line.split("(")[1].split("%")[0].strip())
+                elif "Draws" in line:
+                    stats["draw_pct"] = float(line.split("(")[1].split("%")[0].strip())
+                elif "Move limit" in line:
+                    stats["limit_pct"] = float(line.split("(")[1].split("%")[0].strip())
+            except (IndexError, ValueError):
+                pass
+        return stats
+
     def fmt_time(seconds):
         seconds = int(seconds)
         h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
@@ -918,7 +955,8 @@ def run_training_parallel_hybrid(
         sp_time = time.time() - sp_start
         print(f"\r  Self-play  done in {fmt_time(sp_time)}")
 
-        # Print C++ summary lines (lines starting with spaces or '──')
+        # Parse and print C++ summary lines
+        sp_stats = _parse_selfplay_summary(result.stdout)
         for line in result.stdout.splitlines():
             stripped = line.strip()
             if stripped.startswith("──") or stripped.startswith("White") \
@@ -1001,7 +1039,31 @@ def run_training_parallel_hybrid(
             torch.save(mcts.model.state_dict(), f"model_ep{ep + 1}.pt")
             print(f"  Milestone: model_ep{ep + 1}.pt")
 
-        # ── 8. Evaluation vs random ───────────────────────────────────────────
+        # ── 8. Training log ───────────────────────────────────────────────────
+        with open(train_log_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ep + 1,
+                ep_games,
+                ep_sims,
+                total_positions,
+                f"{sp_time:.1f}",
+                f"{tr_time:.1f}" if losses else "",
+                f"{ep_time:.1f}",
+                f"{losses.get('value_loss',  float('nan')):.4f}" if losses else "",
+                f"{losses.get('policy_loss', float('nan')):.4f}" if losses else "",
+                f"{losses.get('total_loss',  float('nan')):.4f}" if losses else "",
+                len(mcts.memory),
+                f"{buf_pct:.1f}",
+                f"{current_lr:.6f}",
+                f"{sp_stats['white_pct']:.1f}",
+                f"{sp_stats['black_pct']:.1f}",
+                f"{sp_stats['draw_pct']:.1f}",
+                f"{sp_stats['limit_pct']:.1f}",
+                f"{sp_stats['avg_moves']:.1f}",
+            ])
+
+        # ── 9. Evaluation vs random ───────────────────────────────────────────
         """
         if (ep + 1) % eval_interval == 0:
             ev_start = time.time()
