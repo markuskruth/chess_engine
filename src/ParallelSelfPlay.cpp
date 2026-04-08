@@ -84,7 +84,9 @@ void ParallelSelfPlay::worker_fn(int num_games, EvalQueue* queue) {
     AsyncMCTS mcts(queue);
     try {
         for (int g = 0; g < num_games; ++g) {
-            auto [samples, meta] = play_game(mcts, cfg_.temperature);
+            auto [samples, meta] = play_game(mcts, cfg_.temperature,
+                                              cfg_.dirichlet_alpha,
+                                              cfg_.dirichlet_epsilon);
             std::cerr << "[DEBUG worker " << tid << "] game " << (g+1) << "/" << num_games
                       << "  moves=" << meta.moves << "  outcome=" << meta.outcome << "\n" << std::flush;
             std::lock_guard<std::mutex> lk(results_mutex_);
@@ -106,7 +108,8 @@ void ParallelSelfPlay::worker_fn(int num_games, EvalQueue* queue) {
 // Mirrors SelfPlay::play_game() exactly, replacing MCTS with AsyncMCTS.
 
 std::pair<std::vector<Sample>, GameMeta>
-ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature) {
+ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
+                             float dirichlet_alpha, float dirichlet_epsilon) {
     chess::Board board;
 
     struct TrajEntry {
@@ -129,7 +132,10 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature) {
         Node root(board);
 
         // Pipelined: overlaps GPU evaluation with CPU selection for next batch.
-        mcts.run_simulations(root, cfg_.num_simulations, cfg_.leaf_batch_size);
+        // Dirichlet noise is injected into root.P inside run_simulations after
+        // the first NN evaluation, so all subsequent batches use the noisy prior.
+        mcts.run_simulations(root, cfg_.num_simulations, cfg_.leaf_batch_size,
+                             dirichlet_alpha, dirichlet_epsilon);
 
         // Build policy π from visit counts.
         std::array<float, ACTION_DIM> pi{};
@@ -142,10 +148,13 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature) {
             }
         }
 
-        // Sample action (stochastic at temperature > 0, greedy otherwise).
+        // Sample action: stochastic for the first 30 plies, greedy thereafter.
+        // This matches AlphaZero's temperature schedule and ensures the policy
+        // head receives sharp, committed move targets in the endgame phase.
+        const float eff_temp = (step < 30) ? temperature : 0.0f;
         int action_idx = 0;
         if (sum_n > 0.0f) {
-            if (temperature < 1e-3f) {
+            if (eff_temp < 1e-3f) {
                 action_idx = mcts.best_action(root);
             } else {
                 std::discrete_distribution<int> dist(pi.begin(), pi.end());
@@ -179,11 +188,8 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature) {
             outcome = "draw";
         }
     } else {
-        // Move limit reached — heuristic tiebreaker (mirrors Python's threshold 0.3)
-        float pot = ChessEnv::get_evaluation(board);
-        if      (pot >  0.3f) { z =  1.0f; outcome = "white"; }
-        else if (pot < -0.3f) { z = -1.0f; outcome = "black"; }
-        // else z = 0.0f, outcome = "limit"
+        // Move limit reached — recorded as a draw with zero reward.
+        // z = 0.0f, outcome = "limit" (already set above)
     }
 
     // Build samples: flip z so it is always from the perspective of the mover.

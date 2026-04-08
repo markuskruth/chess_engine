@@ -289,18 +289,8 @@ class MCTS:
             else:
                 z = 0.0
         else:
-            # Move limit reached: evaluate position and threshold to decisive/draw.
-            # Only clearly winning/losing positions (|eval| > 0.3 ≈ +230cp) count as decisive.
-            # This gives clean win/draw/loss labels without mimicking the heuristic's
-            # continuous scale.
-            # Potential is always given from real whites perspective
-            pot = ChessEnv.get_evaluation(board)
-            if pot > 0.3:
-                z = 1.0
-            elif pot < -0.3:
-                z = -1.0
-            else:
-                z = 0.0
+            # Move limit reached — recorded as a draw with zero reward.
+            z = 0.0
 
         # Propagate z to every position, flipping sign for Black positions so
         # the target is always from the current player's perspective (matching
@@ -353,6 +343,59 @@ class MCTS:
             "policy_loss": total_pl / num_batches,
             "total_loss":  (total_vl + total_pl) / num_batches,
         }
+
+    def evaluate_vs_model(self, opponent_mcts, num_games=20, num_simulations=100):
+        """
+        Play num_games against another MCTS agent (alternating colors).
+        self is the 'current' model; opponent_mcts is the 'old' model.
+        Returns (win_rate, draw_rate, loss_rate) from self's perspective.
+        """
+        self.model.eval()
+        opponent_mcts.model.eval()
+        wins = draws = losses = 0
+
+        def pick_action(agent, board):
+            state = ChessEnv.encode_state(board)
+            root = Node(state, board.copy())
+            num_batched = num_simulations // agent.leaf_batch_size
+            for _ in range(num_batched):
+                agent.run_simulation_batch(root)
+            return int(np.argmax(root.N))
+
+        for i in range(num_games):
+            board = chess.Board(ChessEnv.reset().fen())
+            current_color = chess.WHITE if i % 2 == 0 else chess.BLACK
+
+            while not board.is_game_over() and board.fullmove_number < 100:
+                if board.turn == current_color:
+                    action_idx = pick_action(self, board)
+                else:
+                    action_idx = pick_action(opponent_mcts, board)
+                ChessEnv.apply_action(action_idx, board)
+
+            result = board.result()
+            if (result == "1-0" and current_color == chess.WHITE) or \
+               (result == "0-1" and current_color == chess.BLACK):
+                wins += 1
+            elif (result == "1-0" and current_color == chess.BLACK) or \
+                 (result == "0-1" and current_color == chess.WHITE):
+                losses += 1
+            elif result == "*":
+                pot = ChessEnv.get_evaluation(board)
+                if (pot > 0.5 and current_color == chess.WHITE) or \
+                   (pot < -0.5 and current_color == chess.BLACK):
+                    wins += 1
+                elif (pot < -0.5 and current_color == chess.WHITE) or \
+                     (pot > 0.5 and current_color == chess.BLACK):
+                    losses += 1
+                else:
+                    draws += 1
+            else:
+                draws += 1
+
+            print(f"  Game {i+1}/{num_games}: {result}  (current={'White' if current_color == chess.WHITE else 'Black'})")
+
+        return wins / num_games, draws / num_games, losses / num_games
 
     def evaluate_vs_random(self, num_games=20, num_simulations=100):
         """
@@ -659,7 +702,6 @@ def run_training_parallel(
                     n,
                     "buffer_latest.npz",
                 ),
-                daemon=True,
             )
             save_thread.start()
             print(f"  Checkpoint saved (ep {ep+1})")
@@ -752,8 +794,8 @@ def run_training_parallel_hybrid(
                 print(f"  WARNING: buffer_latest.npz corrupt ({e}), starting empty")
 
     print(f"Device (training): {mcts.device}")
-    print(f"Workers: {num_workers}  |  Games/episode: {games_per_episode}")
-    print(f"Simulations/position: {num_simulations}  |  Batch size: {batch_size}\n")
+    print(f"Workers: {num_workers}  |  Games/episode: scheduled (400→200→{games_per_episode})")
+    print(f"Simulations/position: scheduled (64→128→192→{num_simulations})  |  Batch size: {batch_size}\n")
 
     # ── Eval log ──────────────────────────────────────────────────────────────
     eval_log_path = "eval_log.csv"
@@ -771,6 +813,36 @@ def run_training_parallel_hybrid(
         if h > 0:   return f"{h}h {m:02d}m {s:02d}s"
         if m > 0:   return f"{m}m {s:02d}s"
         return f"{s}s"
+
+    # Incremental deepening schedule (mirrors AlphaZero curriculum).
+    # Raw targets are rounded up to the nearest multiple of leaf_batch_size so
+    # the C++ runner's divisibility requirement is always satisfied.
+    _SIM_SCHEDULE = [
+        (100, 50),
+        (200, 100),
+        (350, 200),
+        (float("inf"), num_simulations),  # full depth for the rest of training
+    ]
+
+    def get_sims_for_episode(ep_1indexed):
+        """Return sim count for this episode, snapped to a leaf_batch_size multiple."""
+        for cutoff, target in _SIM_SCHEDULE:
+            if ep_1indexed <= cutoff:
+                remainder = target % leaf_batch_size
+                return target if remainder == 0 else target + (leaf_batch_size - remainder)
+        return num_simulations  # unreachable but safe fallback
+
+    _GAMES_SCHEDULE = [
+        (100, 400),
+        (200, 200),
+        (float("inf"), games_per_episode),
+    ]
+
+    def get_games_for_episode(ep_1indexed):
+        for cutoff, target in _GAMES_SCHEDULE:
+            if ep_1indexed <= cutoff:
+                return target
+        return games_per_episode  # unreachable but safe fallback
 
     episode_times = []
     save_thread   = None
@@ -799,27 +871,16 @@ def run_training_parallel_hybrid(
         if mcts.device.type == "cuda":
             torch.cuda.empty_cache()
 
-        game_file = f"games_ep{ep}.bin"
-        cmd = [
-            selfplay_exe,
-            model_file,
-            "--games",   str(games_per_episode),
-            "--workers", str(num_workers),
-            "--sims",    str(num_simulations),
-            "--batch",   str(leaf_batch_size),
-            "--moves",   str(max_moves),
-            "--temp",    str(temperature),
-            "--output",  game_file,
-        ]
-
         # ── 2. C++ self-play subprocess ───────────────────────────────────────
+        ep_sims   = get_sims_for_episode(ep + 1)
+        ep_games  = get_games_for_episode(ep + 1)
         game_file = f"games_ep{ep}.bin"
         cmd = [
             selfplay_exe,
             model_file,
-            "--games",   str(games_per_episode),
+            "--games",   str(ep_games),
             "--workers", str(num_workers),
-            "--sims",    str(num_simulations),
+            "--sims",    str(ep_sims),
             "--batch",   str(leaf_batch_size),
             "--moves",   str(max_moves),
             "--temp",    str(temperature),
@@ -827,8 +888,8 @@ def run_training_parallel_hybrid(
         ]
 
         sp_start = time.time()
-        print(f"  Self-play  running C++ ({games_per_episode} games, "
-              f"{num_workers} workers)...", end="", flush=True)
+        print(f"  Self-play  running C++ ({ep_games} games, "
+              f"{num_workers} workers, {ep_sims} sims)...", end="", flush=True)
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -932,7 +993,6 @@ def run_training_parallel_hybrid(
                 n,
                 "buffer_latest.npz",
             ),
-            daemon=True,
         )
         save_thread.start()
         print(f"  Checkpoint saved (ep {ep + 1})")
@@ -969,67 +1029,78 @@ def run_training_parallel_hybrid(
 
 
 
-def run_benchmark(model_path="checkpoint_latest.pt", num_games=20, num_simulations=100, leaf_batch_size=8):
-    if not os.path.exists(model_path):
-        print(f"Error: Could not find model file at '{model_path}'")
-        return
-
-    print(f"Loading model from {model_path}...")
-    
-    # Initialize MCTS agent
-    # We set buffer_size=1 since we aren't training
-    mcts = MCTS(
-        num_simulations=num_simulations, 
-        leaf_batch_size=leaf_batch_size, 
-        buffer_size=1
-    )
-    
-    # Load the checkpoint safely to the configured device
-    checkpoint = torch.load(model_path, map_location=mcts.device)
-    
-    # Handle both your saved formats: dictionary (checkpoint_latest) or raw weights (model_epX)
+def _load_mcts_from_path(path, num_simulations, leaf_batch_size):
+    """Load a model checkpoint into a new MCTS agent (CPU or GPU auto-detected)."""
+    mcts = MCTS(num_simulations=num_simulations, leaf_batch_size=leaf_batch_size, buffer_size=1)
+    checkpoint = torch.load(path, map_location=mcts.device)
     if isinstance(checkpoint, dict) and "model" in checkpoint:
         mcts.model.load_state_dict(checkpoint["model"])
-        print(f"Loaded full checkpoint (from episode {checkpoint.get('episode', 'unknown')}).")
+        ep = checkpoint.get("episode", "unknown")
+        print(f"  Loaded '{path}'  (episode {ep})")
     else:
         mcts.model.load_state_dict(checkpoint)
-        print("Loaded raw model weights.")
-        
+        print(f"  Loaded '{path}'  (raw weights)")
     mcts.model.eval()
-    
-    print(f"\nStarting benchmark: {num_games} games vs Random Mover...")
-    print(f"Agent plays White on even games, Black on odd games.")
-    print("Evaluating...\n")
-    
+    return mcts
+
+
+def run_benchmark(current_model_path="checkpoint_latest.pt",
+                  old_model_path=None,
+                  num_games=20,
+                  num_simulations=100,
+                  leaf_batch_size=8):
+    """
+    Benchmark the current model against an older version of itself.
+    If old_model_path is None, falls back to playing against a random mover.
+    """
+    for path in [p for p in [current_model_path, old_model_path] if p]:
+        if not os.path.exists(path):
+            print(f"Error: Could not find model file at '{path}'")
+            return
+
+    print("Loading models...")
+    current = _load_mcts_from_path(current_model_path, num_simulations, leaf_batch_size)
+
     start_time = time.time()
-    
-    # Call your existing evaluation function
-    win_r, draw_r, loss_r = mcts.evaluate_vs_random(
-        num_games=num_games, 
-        num_simulations=num_simulations
-    )
-    
+
+    if old_model_path is not None:
+        old = _load_mcts_from_path(old_model_path, num_simulations, leaf_batch_size)
+        print(f"\nStarting benchmark: {num_games} games  (current vs old)")
+        print(f"Current model plays White on even games, Black on odd games.\n")
+        win_r, draw_r, loss_r = current.evaluate_vs_model(
+            old, num_games=num_games, num_simulations=num_simulations)
+        opponent_label = f"old model ({old_model_path})"
+    else:
+        print(f"\nStarting benchmark: {num_games} games vs Random Mover...")
+        print(f"Agent plays White on even games, Black on odd games.\n")
+        win_r, draw_r, loss_r = current.evaluate_vs_random(
+            num_games=num_games, num_simulations=num_simulations)
+        opponent_label = "random mover"
+
     elapsed = time.time() - start_time
-    
-    print("=" * 40)
-    print(" 🎯 BENCHMARK RESULTS")
-    print("=" * 40)
+
+    print()
+    print("=" * 44)
+    print(f"  BENCHMARK RESULTS  (vs {opponent_label})")
+    print("=" * 44)
     print(f"  Wins:   {win_r * 100:>5.1f}%")
     print(f"  Draws:  {draw_r * 100:>5.1f}%")
     print(f"  Losses: {loss_r * 100:>5.1f}%")
-    print("-" * 40)
+    print("-" * 44)
     print(f"  Time:   {elapsed:.1f} seconds")
-    print("=" * 40)
+    print("=" * 44)
 """
 if __name__ == "__main__":
     # You can change the model_path to point to whichever .pt file you want to test
     run_benchmark(
-        model_path="checkpoint_latest.pt", 
-        num_games=20,           # Increase for a more statistically significant test
-        num_simulations=100,    # Number of MCTS rollouts per move
-        leaf_batch_size=8       # Make sure this matches how the MCTS was initialized
-    )
+    current_model_path="checkpoint_latest.pt",
+    old_model_path="model_ep10.pt",
+    num_games=20,
+    num_simulations=100,
+    leaf_batch_size=8
+)
 """
+
 if __name__ == "__main__":
     # Required on Windows: multiprocessing needs the 'spawn' guard
     mp.freeze_support()

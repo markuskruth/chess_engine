@@ -25,7 +25,12 @@ public:
     // selection of batch N+1.  Prefer this over calling run_simulation_batch
     // in a loop — it hides GPU latency and keeps CPU + GPU busy simultaneously.
     // Requires: num_simulations % leaf_batch_size == 0.
-    void run_simulations(Node& root, int num_simulations, int leaf_batch_size);
+    //
+    // dirichlet_alpha / dirichlet_epsilon: when epsilon > 0, Dirichlet noise
+    // Dir(alpha) is mixed into the root prior after the first expansion batch,
+    // matching AlphaZero's exploration scheme.  Pass epsilon=0 to disable.
+    void run_simulations(Node& root, int num_simulations, int leaf_batch_size,
+                         float dirichlet_alpha = 0.3f, float dirichlet_epsilon = 0.0f);
 
     // Single-batch helper (kept for test compatibility and the sequential path).
     // Selects leaf_batch_size leaves, submits to the queue, blocks until all

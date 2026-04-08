@@ -19,6 +19,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <random>
 
 AsyncMCTS::AsyncMCTS(EvalQueue* queue)
     : queue_(queue)
@@ -211,6 +212,39 @@ void AsyncMCTS::flush_pending(PendingBatch& pending) {
     }
 }
 
+// ── apply_dirichlet_noise ─────────────────────────────────────────────────────
+// Mixes Dirichlet(alpha) noise into the root node's prior over legal moves.
+// P(a) = (1 - epsilon) * P(a) + epsilon * eta(a),  eta ~ Dir(alpha).
+// Called once per position, after the root has been expanded by the NN.
+
+static void apply_dirichlet_noise(Node& root, float alpha, float epsilon,
+                                  std::mt19937& rng) {
+    if (!root.P || !root.legal_moves_cache) return;
+
+    auto& P            = *root.P;
+    const auto& legal  = *root.legal_moves_cache;
+
+    // Collect legal action indices.
+    std::vector<int> legal_actions;
+    legal_actions.reserve(64);
+    for (int a = 0; a < ACTION_DIM; ++a)
+        if (legal[a]) legal_actions.push_back(a);
+    if (legal_actions.empty()) return;
+
+    // Sample eta ~ Dir(alpha) via normalised Gamma variates.
+    std::gamma_distribution<float> gamma_dist(alpha, 1.0f);
+    std::vector<float> eta(legal_actions.size());
+    float eta_sum = 0.0f;
+    for (auto& v : eta) { v = gamma_dist(rng); eta_sum += v; }
+    if (eta_sum < 1e-10f) return;
+    const float inv = 1.0f / eta_sum;
+
+    // Mix into priors.
+    const float keep = 1.0f - epsilon;
+    for (int i = 0; i < static_cast<int>(legal_actions.size()); ++i)
+        P[legal_actions[i]] = keep * P[legal_actions[i]] + epsilon * eta[i] * inv;
+}
+
 // ── run_simulations ───────────────────────────────────────────────────────────
 // Pipelined simulation: while the GPU evaluates batch N, the CPU selects and
 // submits batch N+1.  This eliminates the idle CPU time present in the naive
@@ -219,10 +253,18 @@ void AsyncMCTS::flush_pending(PendingBatch& pending) {
 // Safety: batch N+1 selection is done after N's virtual losses are applied but
 // before N's expand+backprop.  This is the same trade-off as ordinary batched
 // virtual loss and does not introduce data races (each worker owns its tree).
+//
+// Dirichlet noise is applied to root.P after the first flush (when the root
+// has been expanded by the NN).  All subsequent batches search with the noisy
+// prior.  If epsilon == 0 noise is skipped entirely.
 
-void AsyncMCTS::run_simulations(Node& root, int num_simulations, int leaf_batch_size) {
+void AsyncMCTS::run_simulations(Node& root, int num_simulations, int leaf_batch_size,
+                                float dirichlet_alpha, float dirichlet_epsilon) {
     const int num_batches = num_simulations / leaf_batch_size;
     if (num_batches <= 0) return;
+
+    static thread_local std::mt19937 rng(std::random_device{}());
+    const bool add_noise = (dirichlet_epsilon > 0.0f) && (num_batches >= 2);
 
     // Seed: submit first batch (no CPU work to overlap yet).
     PendingBatch cur = select_and_submit(root, leaf_batch_size);
@@ -231,6 +273,12 @@ void AsyncMCTS::run_simulations(Node& root, int num_simulations, int leaf_batch_
         // Overlap: select + submit next batch while GPU evaluates current.
         PendingBatch nxt = select_and_submit(root, leaf_batch_size);
         flush_pending(cur);          // wait for current, expand + backprop
+
+        // After the first flush the root is expanded and root.P is populated.
+        // Apply Dirichlet noise once so all remaining batches use the noisy prior.
+        if (b == 1 && add_noise)
+            apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_epsilon, rng);
+
         cur = std::move(nxt);
     }
 
