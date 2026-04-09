@@ -312,7 +312,7 @@ class MCTS:
         meta = {"moves": len(trajectory), "outcome": outcome}
         return data, meta
 
-    def train_network(self, num_batches=50):
+    def train_network(self, num_batches):
         total_vl = total_pl = 0.0
         for _ in range(num_batches):
             batch = self.memory.sample(batch_size=self.batch_size)
@@ -763,7 +763,7 @@ def run_training_parallel_hybrid(
     """
     print("Initializing Hybrid C++/Python Training...")
     mcts = MCTS(
-        buffer_size=100000,
+        buffer_size=1000000,
         batch_size=batch_size,
         num_simulations=num_simulations,
         leaf_batch_size=leaf_batch_size,
@@ -862,11 +862,13 @@ def run_training_parallel_hybrid(
     ]
 
     def get_sims_for_episode(ep_1indexed):
-        """Return sim count for this episode, snapped to a leaf_batch_size multiple."""
+        """Return sim count for this episode, snapped up to a leaf_batch_size multiple.
+        Minimum is 2 * leaf_batch_size so num_batches >= 2 and tree search actually runs."""
         for cutoff, target in _SIM_SCHEDULE:
             if ep_1indexed <= cutoff:
                 remainder = target % leaf_batch_size
-                return target if remainder == 0 else target + (leaf_batch_size - remainder)
+                snapped = target if remainder == 0 else target + (leaf_batch_size - remainder)
+                return max(snapped, 2 * leaf_batch_size)
         return num_simulations  # unreachable but safe fallback
 
     _GAMES_SCHEDULE = [
@@ -920,6 +922,7 @@ def run_training_parallel_hybrid(
             "--sims",    str(ep_sims),
             "--batch",   str(leaf_batch_size),
             "--moves",   str(max_moves),
+            "--episode", str(ep + 1),
             "--temp",    str(temperature),
             "--output",  game_file,
         ]
@@ -985,7 +988,7 @@ def run_training_parallel_hybrid(
         # ── 4. Train on GPU ───────────────────────────────────────────────────
         tr_start = time.time()
         losses = {}
-        if len(mcts.memory) >= batch_size:
+        if len(mcts.memory) >= batch_size * train_batches:
             mcts.model.train() # Switch model to train mode
             losses = mcts.train_network(num_batches=train_batches)
             tr_time = time.time() - tr_start
@@ -1151,19 +1154,21 @@ def run_benchmark(current_model_path="checkpoint_latest.pt",
     print("-" * 44)
     print(f"  Time:   {elapsed:.1f} seconds")
     print("=" * 44)
+
 """
 if __name__ == "__main__":
     # You can change the model_path to point to whichever .pt file you want to test
     run_benchmark(
     current_model_path="checkpoint_latest.pt",
-    old_model_path="model_ep10.pt",
-    num_games=20,
+    old_model_path="model_ep60.pt",
+    num_games=40,
     num_simulations=100,
     leaf_batch_size=8
 )
 """
 
-if __name__ == "__main__":
+#TODO: IMPLEMENT Prioritized Experience Replay (PER)
+if __name__ == "__main__a":
     # Required on Windows: multiprocessing needs the 'spawn' guard
     mp.freeze_support()
 
@@ -1175,11 +1180,11 @@ if __name__ == "__main__":
         selfplay_exe="build/Release/selfplay.exe",
         num_workers=10,           # parallel game threads in C++ (--workers) (n_of_cpu_threads - 2)
         games_per_episode=100,    # total games per episode
-        batch_size=256,
+        batch_size=2048,
         num_simulations=448,     # must be divisible by leaf_batch_size
         leaf_batch_size=64,      # larger batch → bigger GPU batches → higher utilization
         max_moves=400,
-        train_batches=100,
+        train_batches=75,
         temperature=1.0,
         keep_game_files=False,   # delete .bin files after loading
     )
