@@ -1168,7 +1168,7 @@ if __name__ == "__main__":
 """
 
 #TODO: IMPLEMENT Prioritized Experience Replay (PER)
-if __name__ == "__main__a":
+if __name__ == "__main__":
     # Required on Windows: multiprocessing needs the 'spawn' guard
     mp.freeze_support()
 
