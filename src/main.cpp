@@ -40,6 +40,7 @@ struct RunConfig {
     int   num_simulations  = 400;
     int   leaf_batch_size  = 8;
     int   max_moves        = 400;
+    int   episode          = 1;
     float temperature      = 1.0f;
 };
 
@@ -54,7 +55,8 @@ static void print_usage(const char* prog) {
         << "  --threads W    Synonym for --workers\n"
         << "  --sims    S    MCTS simulations/move     (default: 400)\n"
         << "  --batch   B    Leaf batch size           (default: 8)\n"
-        << "  --moves   M    Max moves per game        (default: 200)\n"
+        << "  --moves   M    Max moves per game        (default: 400)\n"
+        << "  --episode E    Current training episode  (default: 1, drives FEN curriculum)\n"
         << "  --temp    T    Temperature               (default: 1.0)\n"
         << "  --output  P    Output binary file        (default: game_data.bin)\n";
 }
@@ -89,6 +91,7 @@ static RunConfig parse_args(int argc, char* argv[]) {
         else if (key == "--sims")                  cfg.num_simulations = std::atoi(val);
         else if (key == "--batch")                 cfg.leaf_batch_size = std::atoi(val);
         else if (key == "--moves")                 cfg.max_moves       = std::atoi(val);
+        else if (key == "--episode")               cfg.episode         = std::atoi(val);
         else if (key == "--temp")                  cfg.temperature     = static_cast<float>(std::atof(val));
         else if (key == "--output")                cfg.output_path     = val;
         else {
@@ -193,6 +196,7 @@ int main(int argc, char* argv[]) {
             pp_cfg.num_simulations = cfg.num_simulations;
             pp_cfg.leaf_batch_size = cfg.leaf_batch_size;
             pp_cfg.max_moves       = cfg.max_moves;
+            pp_cfg.episode         = cfg.episode;
             pp_cfg.temperature     = cfg.temperature;
 
             ParallelSelfPlay psp(pp_cfg);

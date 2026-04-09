@@ -15,6 +15,39 @@
 #include <stdexcept>
 #include <thread>
 
+// ── Curriculum FENs ───────────────────────────────────────────────────────────
+// Used for episodes 1–CURRICULUM_EPISODES instead of the standard start position.
+// Goals: generate decisive games early in training so the value head receives
+// non-zero reward signal from the very first episode.
+//
+// Mix of mate-in-1 positions (verified) and overwhelming material advantages
+// (K+2Q/K+2R/K+Q+R vs lone king, both White-wins and Black-wins variants).
+
+static constexpr int CURRICULUM_EPISODES = 15;
+
+static const std::vector<std::string> CURRICULUM_FENS = {
+    // ── Mate-in-1 (White to move) ─────────────────────────────────────────────
+    "1k6/8/1KQ5/8/8/8/8/8 w - - 0 1",   // Kb6 + Qc6 vs kb8  →  Qc8#
+    "6k1/5Q2/6K1/8/8/8/8/8 w - - 0 1",  // Kg6 + Qf7 vs kg8  →  Qf8#
+    "k7/2Q5/2K5/8/8/8/8/8 w - - 0 1",   // Kc6 + Qc7 vs ka8  →  Qa7#
+    // ── Mate-in-1 (Black to move) ─────────────────────────────────────────────
+    "8/8/8/8/8/8/1q6/1k5K b - - 0 1",   // kb1 + qb2 vs Kh1  →  Qh2#
+    "K7/8/kq6/8/8/8/8/8 b - - 0 1",     // ka6 + qb6 vs Ka8  →  Qa7#
+    "8/8/8/8/8/1k6/2q5/K7 b - - 0 1",   // kb3 + qc2 vs Ka1  →  Qb2#
+    // ── K + 2 Queens vs lone king (White wins) ────────────────────────────────
+    "8/8/3k4/8/8/8/8/2QKQ3 w - - 0 1",
+    // ── K + 2 Rooks vs lone king (White wins) ────────────────────────────────
+    "8/8/3k4/8/8/8/8/2RKR3 w - - 0 1",
+    // ── K + Queen + Rook vs lone king (White wins) ────────────────────────────
+    "8/8/3k4/8/8/8/8/2QKR3 w - - 0 1",
+    // ── k + 2 queens vs lone King (Black wins) ────────────────────────────────
+    "3qkq2/8/8/4K3/8/8/8/8 b - - 0 1",
+    // ── k + 2 rooks vs lone King (Black wins) ────────────────────────────────
+    "3rkr2/8/8/4K3/8/8/8/8 b - - 0 1",
+    // ── k + queen + rook vs lone King (Black wins) ────────────────────────────
+    "3qkr2/8/8/4K3/8/8/8/8 b - - 0 1",
+};
+
 ParallelSelfPlay::ParallelSelfPlay(const ParallelSelfPlayConfig& cfg)
     : cfg_(cfg)
 {}
@@ -110,7 +143,15 @@ void ParallelSelfPlay::worker_fn(int num_games, EvalQueue* queue) {
 std::pair<std::vector<Sample>, GameMeta>
 ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
                              float dirichlet_alpha, float dirichlet_epsilon) {
+    static thread_local std::mt19937 rng(std::random_device{}());
+
+    // Select starting position: curriculum FENs for early episodes, normal start after.
     chess::Board board;
+    if (cfg_.episode <= CURRICULUM_EPISODES) {
+        std::uniform_int_distribution<int> fen_dist(
+            0, static_cast<int>(CURRICULUM_FENS.size()) - 1);
+        board = chess::Board(CURRICULUM_FENS[fen_dist(rng)]);
+    }
 
     struct TrajEntry {
         std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;
@@ -119,8 +160,6 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
     };
     std::vector<TrajEntry> traj;
     traj.reserve(cfg_.max_moves);
-
-    static thread_local std::mt19937 rng(std::random_device{}());
 
     if (cfg_.num_simulations < cfg_.leaf_batch_size)
         throw std::runtime_error("ParallelSelfPlay: num_simulations must be >= leaf_batch_size");
@@ -138,6 +177,10 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
                              dirichlet_alpha, dirichlet_epsilon);
 
         // Build policy π from visit counts.
+        // When num_simulations == leaf_batch_size (num_batches == 1), the root is
+        // expanded but no child is ever visited (all 64 paths are empty), so every
+        // N[a] stays 0. In that case fall back to the raw NN prior P as the policy
+        // target — it still provides a valid gradient for the policy head.
         std::array<float, ACTION_DIM> pi{};
         float sum_n = 0.0f;
         if (root.N) {
@@ -145,12 +188,13 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
             if (sum_n > 0.0f) {
                 const float inv = 1.0f / sum_n;
                 for (int a = 0; a < ACTION_DIM; ++a) pi[a] = (*root.N)[a] * inv;
+            } else if (root.P) {
+                // Single-batch fallback: use NN prior as policy target.
+                pi = *root.P;
             }
         }
 
         // Sample action: stochastic for the first 30 plies, greedy thereafter.
-        // This matches AlphaZero's temperature schedule and ensures the policy
-        // head receives sharp, committed move targets in the endgame phase.
         const float eff_temp = (step < 30) ? temperature : 0.0f;
         int action_idx = 0;
         if (sum_n > 0.0f) {
@@ -158,6 +202,21 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
                 action_idx = mcts.best_action(root);
             } else {
                 std::discrete_distribution<int> dist(pi.begin(), pi.end());
+                action_idx = dist(rng);
+            }
+        } else if (root.is_expanded && root.P && root.legal_moves_cache) {
+            // Single-batch fallback: no child was visited, use NN prior to pick a move.
+            const auto& P     = *root.P;
+            const auto& legal = *root.legal_moves_cache;
+            if (eff_temp < 1e-3f) {
+                float best_p = -1.0f;
+                for (int a = 0; a < ACTION_DIM; ++a)
+                    if (legal[a] && P[a] > best_p) { best_p = P[a]; action_idx = a; }
+            } else {
+                std::vector<float> probs(ACTION_DIM, 0.0f);
+                for (int a = 0; a < ACTION_DIM; ++a)
+                    if (legal[a]) probs[a] = P[a];
+                std::discrete_distribution<int> dist(probs.begin(), probs.end());
                 action_idx = dist(rng);
             }
         }
