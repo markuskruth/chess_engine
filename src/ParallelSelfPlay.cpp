@@ -16,14 +16,14 @@
 #include <thread>
 
 // ── Curriculum FENs ───────────────────────────────────────────────────────────
-// Used for episodes 1–CURRICULUM_EPISODES instead of the standard start position.
+// Used for episodes 1–5 instead of the standard start position.
 // Goals: generate decisive games early in training so the value head receives
 // non-zero reward signal from the very first episode.
 //
 // Mix of mate-in-1 positions (verified) and overwhelming material advantages
 // (K+2Q/K+2R/K+Q+R vs lone king, both White-wins and Black-wins variants).
 
-static constexpr int CURRICULUM_EPISODES = 15;
+static constexpr int CURRICULUM_EPISODES = 5;
 
 static const std::vector<std::string> CURRICULUM_FENS = {
     // ── Mate-in-1 (White to move) ─────────────────────────────────────────────
@@ -58,6 +58,19 @@ std::pair<std::vector<Sample>, std::vector<GameMeta>>
 ParallelSelfPlay::run() {
     // --- ADD THIS LINE TO PREVENT THE OPENMP DEADLOCK ---
     torch::set_num_threads(1);
+
+    // Open output file and write a placeholder header.
+    // The real num_samples is written after all workers complete.
+    if (!cfg_.output_path.empty()) {
+        out_file_.open(cfg_.output_path, std::ios::binary);
+        if (!out_file_)
+            throw std::runtime_error("ParallelSelfPlay: cannot open output file: " + cfg_.output_path);
+        const uint32_t zero = 0, ch = STATE_CHANNELS, bsz = BOARD_SZ;
+        out_file_.write(reinterpret_cast<const char*>(&zero), sizeof(uint32_t));
+        out_file_.write(reinterpret_cast<const char*>(&ch),   sizeof(uint32_t));
+        out_file_.write(reinterpret_cast<const char*>(&bsz),  sizeof(uint32_t));
+    }
+
     // Load model for the central evaluator.
     torch::jit::Module model;
     try {
@@ -106,7 +119,16 @@ ParallelSelfPlay::run() {
     queue.shutdown();
     evaluator.join();
 
-    return {all_samples_, all_meta_};
+    // Seek back to position 0 and write the real sample count into the header.
+    if (out_file_.is_open()) {
+        out_file_.flush();
+        out_file_.seekp(0, std::ios::beg);
+        out_file_.write(reinterpret_cast<const char*>(&total_samples_written_),
+                        sizeof(uint32_t));
+        out_file_.close();
+    }
+
+    return {{}, all_meta_};  // samples are already on disk; return empty vector
 }
 
 // ── worker_fn ─────────────────────────────────────────────────────────────────
@@ -122,10 +144,21 @@ void ParallelSelfPlay::worker_fn(int num_games, EvalQueue* queue) {
                                               cfg_.dirichlet_epsilon);
             std::cerr << "[DEBUG worker " << tid << "] game " << (g+1) << "/" << num_games
                       << "  moves=" << meta.moves << "  outcome=" << meta.outcome << "\n" << std::flush;
-            std::lock_guard<std::mutex> lk(results_mutex_);
-            all_samples_.insert(all_samples_.end(),
-                                samples.begin(), samples.end());
-            all_meta_.push_back(std::move(meta));
+            {
+                std::lock_guard<std::mutex> lk(results_mutex_);
+                // Stream samples directly to disk — no RAM accumulation.
+                if (out_file_.is_open()) {
+                    for (const auto& s : samples) {
+                        out_file_.write(reinterpret_cast<const char*>(s.state.data()),
+                                        s.state.size() * sizeof(float));
+                        out_file_.write(reinterpret_cast<const char*>(s.pi.data()),
+                                        s.pi.size() * sizeof(float));
+                        out_file_.write(reinterpret_cast<const char*>(&s.z), sizeof(float));
+                    }
+                    total_samples_written_ += static_cast<uint32_t>(samples.size());
+                }
+                all_meta_.push_back(std::move(meta));
+            }
         }
     } catch (const std::exception& ex) {
         // Log and continue — other workers should not be affected.

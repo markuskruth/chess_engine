@@ -210,13 +210,20 @@ int main(int argc, char* argv[]) {
     }
 
     // ── Write binary data ─────────────────────────────────────────────────────
-    std::cout << "\n[write_data] " << samples.size() << " sample(s) → "
-              << cfg.output_path << "\n";
-    try {
-        SelfPlay::write_data(cfg.output_path, samples);
-    } catch (const std::exception& ex) {
-        std::cerr << "[ERROR] write_data: " << ex.what() << "\n";
-        return 1;
+    // ParallelSelfPlay streams samples directly to disk during run(); samples
+    // will be empty in that case and write_data() is skipped.
+    if (!samples.empty()) {
+        std::cout << "\n[write_data] " << samples.size() << " sample(s) → "
+                  << cfg.output_path << "\n";
+        try {
+            SelfPlay::write_data(cfg.output_path, samples);
+        } catch (const std::exception& ex) {
+            std::cerr << "[ERROR] write_data: " << ex.what() << "\n";
+            return 1;
+        }
+    } else {
+        std::cout << "\n[write_data] samples streamed to " << cfg.output_path
+                  << " during self-play\n";
     }
 
     print_summary(meta);

@@ -10,6 +10,7 @@
 #include "AsyncMCTS.h"
 #include "CentralEvaluator.h"
 #include "SelfPlay.h"     // reuses Sample, GameMeta, SelfPlayConfig
+#include <fstream>
 #include <mutex>
 #include <vector>
 
@@ -68,10 +69,14 @@ public:
 private:
     ParallelSelfPlayConfig cfg_;
 
-    // Accumulated across worker threads; protected by results_mutex_.
-    std::vector<Sample>   all_samples_;
+    // Metadata accumulated across worker threads; protected by results_mutex_.
     std::vector<GameMeta> all_meta_;
     std::mutex            results_mutex_;
+
+    // Streaming output: samples are written directly to file as games complete
+    // (never accumulated in RAM).  Opened in run(), closed after all workers done.
+    std::ofstream out_file_;
+    uint32_t      total_samples_written_ = 0;
 
     // Worker thread entry point: plays num_games games, then signals queue.
     void worker_fn(int num_games, EvalQueue* queue);

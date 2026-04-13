@@ -1,19 +1,16 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from ChessEnv import ChessEnv
 from Neuralnet import CNNNet
-from utils import ReplayBuffer
+from utils import PrioritizedReplayBuffer
 from data_loader import load_binary_game_data
 import chess
 import csv
 import random
 import subprocess
 import sys
-from collections import deque
 from datetime import datetime
-import multiprocessing as mp
 import os
 import time
 import threading
@@ -57,7 +54,7 @@ class MCTS:
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.5)
         self.scaler = torch.amp.GradScaler("cuda", enabled=(self.device.type == "cuda"))
-        self.memory = ReplayBuffer(capacity=buffer_size)
+        self.memory = PrioritizedReplayBuffer(capacity=buffer_size)
         self.batch_size = batch_size
         self.num_simulations = num_simulations
         self.leaf_batch_size = leaf_batch_size
@@ -254,90 +251,42 @@ class MCTS:
                 node.total_N    += 1
 
 
-    def play_game(self, temperature=1.0, max_moves=200):
-        board = ChessEnv.reset()
-        trajectory = []
-
-        for _ in range(max_moves):
-            if board.is_game_over():
-                break
-
-            state = ChessEnv.encode_state(board)
-            turn = board.turn
-
-            # Fresh MCTS tree for each position
-            root = Node(state, board.copy())
-            num_batched = self.num_simulations // self.leaf_batch_size
-            for _ in range(num_batched):
-                self.run_simulation_batch(root)
-
-            # Policy from visit counts
-            N = root.N.copy().astype(np.float32)
-            pi = N / (np.sum(N) + 1e-10)
-            action_idx = np.random.choice(len(pi), p=pi)
-
-            trajectory.append({"state": state, "pi": pi, "turn": turn})
-            ChessEnv.apply_action(action_idx, board)
-
-        # --- Determine terminal value from White's perspective ---
-        if board.is_game_over():
-            # Actual game result: +1 White wins, -1 Black wins, 0 draw
-            result = board.result()
-            if result == "1-0":
-                z = 1.0
-            elif result == "0-1":
-                z = -1.0
-            else:
-                z = 0.0
-        else:
-            # Move limit reached — recorded as a draw with zero reward.
-            z = 0.0
-
-        # Propagate z to every position, flipping sign for Black positions so
-        # the target is always from the current player's perspective (matching
-        # the flipped board encoding).
-        data = [
-            (entry["state"], entry["pi"], z if entry["turn"] == chess.WHITE else -z)
-            for entry in trajectory
-        ]
-
-        if board.is_game_over():
-            result = board.result()
-            if result == "1-0":   outcome = "white"
-            elif result == "0-1": outcome = "black"
-            else:                 outcome = "draw"
-        else:
-            outcome = "limit"
-
-        meta = {"moves": len(trajectory), "outcome": outcome}
-        return data, meta
-
     def train_network(self, num_batches):
         total_vl = total_pl = 0.0
         for _ in range(num_batches):
-            batch = self.memory.sample(batch_size=self.batch_size)
-            states, target_pis, target_vs = batch
+            states, target_pis, target_vs, indices, is_weights = \
+                self.memory.sample(batch_size=self.batch_size)
 
             # Zero-copy numpy→tensor path; non_blocking overlaps GPU transfer (Fix #7)
             states_tensor     = torch.from_numpy(states).to(self.device, non_blocking=True)
             target_pis_tensor = torch.from_numpy(target_pis).to(self.device, non_blocking=True)
             target_vs_tensor  = torch.from_numpy(target_vs).to(self.device, non_blocking=True)
+            is_weights_tensor = torch.from_numpy(is_weights).to(self.device, non_blocking=True)
 
             with torch.autocast(device_type=self.device.type):
                 pred_p, pred_v = self.model(states_tensor)
                 pred_p = pred_p.view(pred_p.size(0), -1)
-                value_loss = nn.MSELoss()(pred_v, target_vs_tensor)
-                log_probs = torch.log_softmax(pred_p, dim=1)
-                policy_loss = -(target_pis_tensor * log_probs).sum(dim=1).mean()
-                loss = value_loss + policy_loss
+
+                # Per-sample losses (shape: [batch])
+                value_loss_per  = (pred_v - target_vs_tensor).pow(2).squeeze(1)
+                log_probs       = torch.log_softmax(pred_p, dim=1)
+                policy_loss_per = -(target_pis_tensor * log_probs).sum(dim=1)
+
+                # IS-weighted mean — corrects for non-uniform sampling bias
+                loss = (is_weights_tensor * (value_loss_per + policy_loss_per)).mean()
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_vl += value_loss.item()
-            total_pl += policy_loss.item()
+            # Update priorities using absolute value-head error (analogous to TD error)
+            with torch.no_grad():
+                td_errors = value_loss_per.detach().float().sqrt().cpu().numpy()
+            self.memory.update_priorities(indices, td_errors)
+
+            total_vl += value_loss_per.mean().item()
+            total_pl += policy_loss_per.mean().item()
 
         return {
             "value_loss":  total_vl / num_batches,
@@ -446,296 +395,46 @@ class MCTS:
         return wins / num_games, draws / num_games, losses / num_games
 
 
-def _save_buffer_bg(states, policies, values, index, size, path):
-    """Background thread target: compress and write the replay buffer (Fix #6)."""
+# ── Dynamic Replay Window schedule ────────────────────────────────────────────
+
+_PER_INITIAL_CAP = 500_000
+_PER_CAP_STEP    = 250_000
+_PER_MAX_CAP     = 1_500_000
+_PER_GROW_EVERY  = 10   # episodes between each growth step
+
+def _per_target_capacity(ep_0indexed):
+    """Return the buffer capacity for the given 0-indexed episode number.
+
+    Schedule (0-indexed episode → capacity):
+      0–9   → 500 K
+      10–19 → 750 K
+      20–29 → 1 M
+      ...
+      60+   → 2 M  (capped)
+    """
+    steps = ep_0indexed // _PER_GROW_EVERY
+    return min(_PER_INITIAL_CAP + steps * _PER_CAP_STEP, _PER_MAX_CAP)
+
+
+def _save_buffer_bg(states, policy_indices, policy_values, values, index, size, path, tree):
+    """Background thread target: compress and write the replay buffer."""
     np.savez_compressed(
         path,
         states=states,
-        policies=policies,
+        policy_indices=policy_indices,
+        policy_values=policy_values,
         values=values,
         index=np.array(index),
         size=np.array(size),
+        tree=tree,
     )
 
-
-def _worker_play_games(args):
-    """
-    Top-level worker function for multiprocessing (must be module-level to be
-    picklable on Windows, which uses 'spawn' instead of 'fork').
-
-    Runs entirely on CPU — GPU inference at batch-size 1 has too much
-    launch overhead to be faster than CPU for this workload.
-    """
-    state_dict, num_games, num_simulations, max_moves, leaf_batch_size, _ = args
-
-    # Build model directly on CPU — avoids allocating on GPU then immediately moving back (Fix #3)
-    agent = MCTS(num_simulations=num_simulations, leaf_batch_size=leaf_batch_size, device='cpu', buffer_size=1)
-    agent.model.load_state_dict(state_dict)
-    agent.model.eval()
-
-    all_data = []
-    all_meta = []
-    for _ in range(num_games):
-        data, meta = agent.play_game(max_moves=max_moves)
-        all_data.extend(data)
-        all_meta.append(meta)
-    return all_data, all_meta
-
-
-def run_training(
-    episodes,
-    num_games_per_episode,
-    batch_size,
-    num_simulations
-    ):
-    """Single-process training loop (kept for reference / quick experiments)."""
-    print("Initializing MCTS Chess Training Engine...")
-    mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations)
-
-    print(f"Device: {mcts.device}")
-    print(f"Running {episodes} episodes with {num_games_per_episode} games per episode")
-    print(f"Simulations per position: {num_simulations}")
-    print(f"Batch size: {batch_size}\n")
-
-    for ep in range(episodes):
-        print(f"Episode {ep+1}/{episodes}")
-
-        for game_idx in range(num_games_per_episode):
-            game_data, _ = mcts.play_game()
-            for state, policy, value in game_data:
-                mcts.memory.add(state, policy, np.array([value]))
-
-            if (game_idx + 1) % 25 == 0:
-                print(f"  Games: {game_idx + 1}/{num_games_per_episode} | Buffer: {len(mcts.memory)}")
-
-        if len(mcts.memory) > batch_size:
-            print(f"  Training... ", end="", flush=True)
-            mcts.train_network(num_batches=50)
-            print("done")
-
-        if (ep + 1) % 5 == 0:
-            torch.save(mcts.model.state_dict(), f"model_checkpoint_ep{ep+1}.pt")
-            print(f"  Saved: model_checkpoint_ep{ep+1}.pt\n")
-
-    print("\n" + "="*50)
-    print("Training Complete!")
-    print("="*50)
-
-
-def run_training_parallel(
-    episodes,
-    num_workers=5,
-    games_per_worker=2,
-    batch_size=64,
-    num_simulations=200,
-    max_moves=200,
-    train_batches=50,
-    leaf_batch_size=8,
-):
-    """
-    Parallel training loop.
-
-    Self-play is distributed across `num_workers` CPU processes.
-    Network training runs on GPU (or CPU if unavailable) in the main process.
-
-    Each episode:
-      1. Broadcast current model weights (CPU copy) to all workers.
-      2. Workers play `games_per_worker` games each in parallel.
-      3. Main process collects all game data into the replay buffer.
-      4. Main process trains the network for `train_batches` gradient steps.
-      5. Repeat.
-
-    Recommended for a 6-core CPU: num_workers=5 (leaves 1 core for main).
-    """
-    print("Initializing Parallel MCTS Training...")
-    mcts = MCTS(buffer_size=100000, batch_size=batch_size, num_simulations=num_simulations, leaf_batch_size=leaf_batch_size)
-
-    # --- RESUME ---
-    start_ep = 0
-    if os.path.exists("checkpoint_latest.pt"):
-        print("Found checkpoint_latest.pt — resuming...")
-        ckpt = torch.load("checkpoint_latest.pt", map_location=mcts.device)
-        mcts.model.load_state_dict(ckpt["model"])
-        mcts.optimizer.load_state_dict(ckpt["optimizer"])
-        mcts.scheduler.load_state_dict(ckpt["scheduler"])
-        mcts.scaler.load_state_dict(ckpt["scaler"])
-        start_ep = ckpt["episode"] + 1
-        print(f"  Resumed from episode {ckpt['episode'] + 1}")
-
-        if os.path.exists("buffer_latest.npz"):
-            try:
-                data = np.load("buffer_latest.npz")
-                n = int(data["size"])
-                mcts.memory.states[:n] = data["states"]
-                mcts.memory.policies[:n] = data["policies"]
-                mcts.memory.values[:n] = data["values"]
-                mcts.memory.index = int(data["index"])
-                mcts.memory.size = n
-                print(f"  Replay buffer restored: {n} positions")
-            except Exception as e:
-                print(f"  WARNING: buffer_latest.npz is corrupt ({e}), starting with empty buffer")
-
-    total_games = num_workers * games_per_worker
-    print(f"Device (training): {mcts.device}")
-    print(f"Workers: {num_workers}  |  Games/episode: {total_games}")
-    print(f"Simulations/position: {num_simulations}  |  Batch size: {batch_size}\n")
-
-    episode_times = []
-    save_thread = None  # background buffer-save thread (Fix #6)
-
-    # --- EVAL LOG SETUP ---
-    eval_log_path = "eval_log.csv"
-    eval_interval = 5  # run evaluation every N episodes
-    if not os.path.exists(eval_log_path):
-        with open(eval_log_path, "w", newline="") as f:
-            csv.writer(f).writerow(["episode", "win_rate", "draw_rate", "loss_rate",
-                                    "value_loss", "policy_loss"])
-
-    def fmt_time(seconds):
-        seconds = int(seconds)
-        h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
-        if h > 0:
-            return f"{h}h {m:02d}m {s:02d}s"
-        elif m > 0:
-            return f"{m}m {s:02d}s"
-        return f"{s}s"
-
-    with mp.Pool(processes=num_workers) as pool:
-        for ep in range(start_ep, episodes):
-            ep_start = time.time()
-            print(f"\n{'─' * 56}")
-            print(f"Episode {ep+1}/{episodes}")
-
-            # --- 1. PARALLEL SELF-PLAY ---
-            cpu_state_dict = {k: v.cpu() for k, v in mcts.model.state_dict().items()}
-            worker_args = [
-                (cpu_state_dict, games_per_worker, num_simulations, max_moves, leaf_batch_size, i)
-                for i in range(num_workers)
-            ]
-
-            sp_start = time.time()
-            all_game_data = []
-            all_meta = []
-            workers_done = 0
-            for game_data, game_meta in pool.imap_unordered(_worker_play_games, worker_args):
-                workers_done += 1
-                all_game_data.append(game_data)
-                all_meta.extend(game_meta)
-                print(f"\r  Self-play  [{workers_done}/{num_workers} workers done]", end="", flush=True)
-            sp_time = time.time() - sp_start
-
-            # Ensure previous episode's buffer save finished before we write to the buffer
-            if save_thread is not None:
-                save_thread.join()
-
-            # --- 2. COLLECT DATA ---
-            total_positions = 0
-            for game_data in all_game_data:
-                for state, policy, value in game_data:
-                    mcts.memory.add(state, policy, np.array([value]))
-                    total_positions += 1
-
-            outcomes = [m["outcome"] for m in all_meta]
-            avg_moves = sum(m["moves"] for m in all_meta) / max(len(all_meta), 1)
-            n_games = len(all_meta)
-            w = outcomes.count("white")
-            b = outcomes.count("black")
-            d = outcomes.count("draw")
-            lim = outcomes.count("limit")
-
-            print(f"\r  Self-play  {n_games} games | {total_positions} positions | "
-                  f"avg {avg_moves:.0f} moves | "
-                  f"W {w/n_games*100:.0f}% D {d/n_games*100:.0f}% B {b/n_games*100:.0f}%"
-                  + (f" limit {lim/n_games*100:.0f}%" if lim else "")
-                  + f" | {fmt_time(sp_time)}")
-
-            # --- 3. TRAIN ON GPU ---
-            tr_start = time.time()
-            losses = {}
-            if len(mcts.memory) > batch_size:
-                losses = mcts.train_network(num_batches=train_batches)
-                tr_time = time.time() - tr_start
-                print(f"  Training   {train_batches} batches | "
-                      f"val {losses['value_loss']:.4f}  "
-                      f"pol {losses['policy_loss']:.4f}  "
-                      f"total {losses['total_loss']:.4f} | {fmt_time(tr_time)}")
-            else:
-                print(f"  Training   skipped (buffer {len(mcts.memory)} < batch {batch_size})")
-
-            # --- 4. LR SCHEDULE ---
-            mcts.scheduler.step()
-            current_lr = mcts.optimizer.param_groups[0]['lr']
-
-            buf_pct = len(mcts.memory) / mcts.memory.capacity * 100
-            print(f"  Buffer     {len(mcts.memory):,} / {mcts.memory.capacity:,} ({buf_pct:.1f}%)  "
-                  f"LR {current_lr:.6f}")
-
-            # --- 5. ETA ---
-            ep_time = time.time() - ep_start
-            episode_times.append(ep_time)
-            avg_ep_time = sum(episode_times[-20:]) / len(episode_times[-20:])
-            remaining_eps = episodes - (ep + 1)
-            eta = avg_ep_time * remaining_eps
-            print(f"  Episode time: {fmt_time(ep_time)}  |  ETA: {fmt_time(eta)}")
-
-            # --- 6. CHECKPOINT (every episode) ---
-            # Model state is small and fast — save synchronously
-            torch.save({
-                "episode": ep,
-                "model": mcts.model.state_dict(),
-                "optimizer": mcts.optimizer.state_dict(),
-                "scheduler": mcts.scheduler.state_dict(),
-                "scaler": mcts.scaler.state_dict(),
-            }, "checkpoint_latest.pt")
-
-            # Buffer save is expensive (up to ~2.4 GB compressed) — run in background
-            # so it overlaps with the next episode's self-play phase (Fix #6).
-            # The join at the top of the loop ensures it finishes before the buffer
-            # is modified again during collect.
-            n = mcts.memory.size
-            save_thread = threading.Thread(
-                target=_save_buffer_bg,
-                args=(
-                    mcts.memory.states[:n],
-                    mcts.memory.policies[:n],
-                    mcts.memory.values[:n],
-                    mcts.memory.index,
-                    n,
-                    "buffer_latest.npz",
-                ),
-            )
-            save_thread.start()
-            print(f"  Checkpoint saved (ep {ep+1})")
-
-            if (ep + 1) % 10 == 0:
-                torch.save(mcts.model.state_dict(), f"model_ep{ep+1}.pt")
-                print(f"  Milestone: model_ep{ep+1}.pt")
-
-            # --- 7. EVALUATION vs RANDOM ---
-            if (ep + 1) % eval_interval == 0:
-                ev_start = time.time()
-                win_r, draw_r, loss_r = mcts.evaluate_vs_random(num_games=20, num_simulations=100)
-                ev_time = time.time() - ev_start
-                val_loss = losses.get("value_loss", float("nan")) if len(mcts.memory) > batch_size else float("nan")
-                pol_loss = losses.get("policy_loss", float("nan")) if len(mcts.memory) > batch_size else float("nan")
-                with open(eval_log_path, "a", newline="") as f:
-                    csv.writer(f).writerow([ep + 1, f"{win_r:.3f}", f"{draw_r:.3f}", f"{loss_r:.3f}",
-                                            f"{val_loss:.4f}", f"{pol_loss:.4f}"])
-                print(f"  Eval vs random  W {win_r*100:.0f}%  D {draw_r*100:.0f}%  L {loss_r*100:.0f}%  | {fmt_time(ev_time)}")
-
-    # Wait for the last episode's buffer save to finish before exiting
-    if save_thread is not None:
-        save_thread.join()
-
-    print("\n" + "="*50)
-    print("Training Complete!")
-    print("="*50)
 
 def run_training_parallel_hybrid(
     episodes,
     selfplay_exe="build/Release/selfplay.exe",
-    num_workers=4,
-    games_per_episode=20,
+    num_workers=10,
+    games_per_episode=40,
     batch_size=256,
     num_simulations=400,
     leaf_batch_size=8,
@@ -763,7 +462,7 @@ def run_training_parallel_hybrid(
     """
     print("Initializing Hybrid C++/Python Training...")
     mcts = MCTS(
-        buffer_size=1000000,
+        buffer_size=_PER_INITIAL_CAP,
         batch_size=batch_size,
         num_simulations=num_simulations,
         leaf_batch_size=leaf_batch_size,
@@ -785,11 +484,24 @@ def run_training_parallel_hybrid(
             try:
                 data = np.load("buffer_latest.npz")
                 n = int(data["size"])
-                mcts.memory.states[:n]   = data["states"]
-                mcts.memory.policies[:n] = data["policies"]
-                mcts.memory.values[:n]   = data["values"]
+                # Grow to accommodate resumed episode's target capacity and any existing data
+                resume_cap = max(_per_target_capacity(start_ep), n)
+                resume_cap = min(resume_cap, _PER_MAX_CAP)
+                if resume_cap > mcts.memory.capacity:
+                    mcts.memory.grow(resume_cap)
+                mcts.memory.states[:n] = data["states"]
+                if "policy_indices" in data:
+                    mcts.memory.policy_indices[:n] = data["policy_indices"]
+                    mcts.memory.policy_values[:n]  = data["policy_values"]
+                else:
+                    print("  WARNING: old dense-policy checkpoint — policies will be empty")
+                mcts.memory.values[:n] = data["values"]
                 mcts.memory.index        = int(data["index"])
                 mcts.memory.size         = n
+                if "tree" in data:
+                    mcts.memory.restore_tree(data["tree"])
+                else:
+                    mcts.memory.restore_uniform()
                 print(f"  Replay buffer restored: {n} positions")
             except Exception as e:
                 print(f"  WARNING: buffer_latest.npz corrupt ({e}), starting empty")
@@ -797,16 +509,6 @@ def run_training_parallel_hybrid(
     print(f"Device (training): {mcts.device}")
     print(f"Workers: {num_workers}  |  Games/episode: scheduled (400→200→{games_per_episode})")
     print(f"Simulations/position: scheduled (64→128→192→{num_simulations})  |  Batch size: {batch_size}\n")
-
-    # ── Eval log ──────────────────────────────────────────────────────────────
-    eval_log_path = "eval_log.csv"
-    eval_interval = 5
-    if not os.path.exists(eval_log_path):
-        with open(eval_log_path, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["episode", "win_rate", "draw_rate", "loss_rate",
-                 "value_loss", "policy_loss"]
-            )
 
     # ── Training log ──────────────────────────────────────────────────────────
     train_log_path = "training_log.csv"
@@ -855,9 +557,9 @@ def run_training_parallel_hybrid(
     # Raw targets are rounded up to the nearest multiple of leaf_batch_size so
     # the C++ runner's divisibility requirement is always satisfied.
     _SIM_SCHEDULE = [
-        (100, 50),
-        (200, 100),
-        (350, 200),
+        (50, 50),
+        (90, 100),
+        (250, 200),
         (float("inf"), num_simulations),  # full depth for the rest of training
     ]
 
@@ -868,12 +570,13 @@ def run_training_parallel_hybrid(
             if ep_1indexed <= cutoff:
                 remainder = target % leaf_batch_size
                 snapped = target if remainder == 0 else target + (leaf_batch_size - remainder)
-                return max(snapped, 2 * leaf_batch_size)
+                return max(snapped, 4 * leaf_batch_size)
         return num_simulations  # unreachable but safe fallback
 
     _GAMES_SCHEDULE = [
+        (50, 400),
         (100, 400),
-        (200, 200),
+        (300, 200),
         (float("inf"), games_per_episode),
     ]
 
@@ -890,6 +593,13 @@ def run_training_parallel_hybrid(
         ep_start = time.time()
         print(f"\n{'─' * 56}")
         print(f"Episode {ep + 1}/{episodes}")
+
+        # ── 0. Dynamic Replay Window ──────────────────────────────────────────
+        target_cap = _per_target_capacity(ep)
+        if target_cap > mcts.memory.capacity:
+            old_cap = mcts.memory.capacity
+            mcts.memory.grow(target_cap)
+            print(f"  Buffer     grew {old_cap:,} → {target_cap:,}")
 
         # ── 1. Export TorchScript model ───────────────────────────────────────
         model_file = "model_current.pt"
@@ -986,6 +696,8 @@ def run_training_parallel_hybrid(
             total_positions = 0
 
         # ── 4. Train on GPU ───────────────────────────────────────────────────
+        # Anneal PER beta from 0.4 → 1.0 over the full training run
+        mcts.memory.set_beta(0.4 + 0.6 * (ep - start_ep) / max(episodes - start_ep - 1, 1))
         tr_start = time.time()
         losses = {}
         if len(mcts.memory) >= batch_size * train_batches:
@@ -1024,15 +736,18 @@ def run_training_parallel_hybrid(
         }, "checkpoint_latest.pt")
 
         n = mcts.memory.size
+        tree_snap = mcts.memory.get_tree_snapshot()
         save_thread = threading.Thread(
             target=_save_buffer_bg,
             args=(
                 mcts.memory.states[:n],
-                mcts.memory.policies[:n],
+                mcts.memory.policy_indices[:n],
+                mcts.memory.policy_values[:n],
                 mcts.memory.values[:n],
                 mcts.memory.index,
                 n,
                 "buffer_latest.npz",
+                tree_snap,
             ),
         )
         save_thread.start()
@@ -1066,25 +781,6 @@ def run_training_parallel_hybrid(
                 f"{sp_stats['avg_moves']:.1f}",
             ])
 
-        # ── 9. Evaluation vs random ───────────────────────────────────────────
-        """
-        if (ep + 1) % eval_interval == 0:
-            ev_start = time.time()
-            win_r, draw_r, loss_r = mcts.evaluate_vs_random(
-                num_games=20, num_simulations=100
-            )
-            ev_time  = time.time() - ev_start
-            val_loss = losses.get("value_loss",  float("nan"))
-            pol_loss = losses.get("policy_loss", float("nan"))
-            with open(eval_log_path, "a", newline="") as f:
-                csv.writer(f).writerow([
-                    ep + 1, f"{win_r:.3f}", f"{draw_r:.3f}", f"{loss_r:.3f}",
-                    f"{val_loss:.4f}", f"{pol_loss:.4f}",
-                ])
-            print(f"  Eval vs random  "
-                  f"W {win_r*100:.0f}%  D {draw_r*100:.0f}%  L {loss_r*100:.0f}%"
-                  f"  | {fmt_time(ev_time)}")
-        """
     if save_thread is not None:
         save_thread.join()
 
@@ -1155,23 +851,19 @@ def run_benchmark(current_model_path="checkpoint_latest.pt",
     print(f"  Time:   {elapsed:.1f} seconds")
     print("=" * 44)
 
-"""
+
 if __name__ == "__main__":
     # You can change the model_path to point to whichever .pt file you want to test
     run_benchmark(
     current_model_path="checkpoint_latest.pt",
     old_model_path="model_ep60.pt",
-    num_games=40,
+    num_games=20,
     num_simulations=100,
     leaf_batch_size=8
 )
-"""
 
-#TODO: IMPLEMENT Prioritized Experience Replay (PER)
-if __name__ == "__main__":
-    # Required on Windows: multiprocessing needs the 'spawn' guard
-    mp.freeze_support()
-
+# TODO: Maybe drop learning rate to 0.0001
+if __name__ == "__main__z":
     # ── Hybrid training (C++ self-play + Python training) ─────────────────────
     # Requires a compiled selfplay.exe.  Build with:
     #   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
@@ -1181,22 +873,10 @@ if __name__ == "__main__":
         num_workers=10,           # parallel game threads in C++ (--workers) (n_of_cpu_threads - 2)
         games_per_episode=100,    # total games per episode
         batch_size=2048,
-        num_simulations=448,     # must be divisible by leaf_batch_size
-        leaf_batch_size=64,      # larger batch → bigger GPU batches → higher utilization
+        num_simulations=448,      # must be divisible by leaf_batch_size
+        leaf_batch_size=64,       # larger batch → bigger GPU batches → higher utilization
         max_moves=400,
-        train_batches=75,
+        train_batches=50,
         temperature=1.0,
-        keep_game_files=False,   # delete .bin files after loading
+        keep_game_files=False,    # delete .bin files after loading
     )
-
-    # ── Pure-Python fallback (uncomment to use instead) ───────────────────────
-    # run_training_parallel(
-    #     episodes=500,
-    #     num_workers=8,
-    #     games_per_worker=3,
-    #     batch_size=256,
-    #     num_simulations=400,
-    #     leaf_batch_size=8,
-    #     max_moves=200,
-    #     train_batches=100,
-    # )
