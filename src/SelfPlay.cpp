@@ -58,6 +58,7 @@ SelfPlay::play_game(float temperature) {
         std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;
         std::array<float, ACTION_DIM>                            pi;
         chess::Color                                             turn;
+        float                                                    eval_white;  // heuristic from White's perspective
     };
     std::vector<TrajEntry> traj;
     traj.reserve(cfg_.max_moves);
@@ -103,7 +104,7 @@ SelfPlay::play_game(float temperature) {
             }
         }
 
-        // Store encoded state + policy for this ply
+        // Store encoded state + policy + heuristic eval for this ply
         {
             auto state_t = ChessEnv::encode_state(board)
                                .to(torch::kCPU).contiguous();
@@ -112,8 +113,9 @@ SelfPlay::play_game(float temperature) {
                       state_t.data_ptr<float>()
                           + STATE_CHANNELS * BOARD_SZ * BOARD_SZ,
                       entry.state.begin());
-            entry.pi   = pi;
-            entry.turn = turn;
+            entry.pi         = pi;
+            entry.turn       = turn;
+            entry.eval_white = ChessEnv::get_evaluation(board);
             traj.push_back(entry);
         }
 
@@ -142,14 +144,15 @@ SelfPlay::play_game(float temperature) {
         // else z = 0.0f, outcome = "limit" (already set)
     }
 
-    // Build samples: flip z for Black's plies so it is always current-player-relative
+    // Build samples: flip z and eval_target for Black's plies so both are mover-relative
     std::vector<Sample> samples;
     samples.reserve(traj.size());
     for (const auto& e : traj) {
         Sample s;
-        s.state = e.state;
-        s.pi    = e.pi;
-        s.z     = (e.turn == chess::Color::WHITE) ? z : -z;
+        s.state       = e.state;
+        s.pi          = e.pi;
+        s.z           = (e.turn == chess::Color::WHITE) ? z : -z;
+        s.eval_target = (e.turn == chess::Color::WHITE) ? e.eval_white : -e.eval_white;
         samples.push_back(s);
     }
 
@@ -164,7 +167,7 @@ SelfPlay::play_game(float temperature) {
 //
 // Binary format (matches Python's load_binary_game_data()):
 //   Header:   uint32 num_samples | uint32 state_channels(20) | uint32 board_size(8)
-//   Per sample: float32[1280] state | float32[4672] pi | float32[1] z
+//   Per sample: float32[1280] state | float32[4672] pi | float32[1] z | float32[1] eval_target
 
 void SelfPlay::write_data(const std::string& path,
                            const std::vector<Sample>& samples) {
@@ -183,6 +186,7 @@ void SelfPlay::write_data(const std::string& path,
                 s.state.size() * sizeof(float));
         f.write(reinterpret_cast<const char*>(s.pi.data()),
                 s.pi.size() * sizeof(float));
-        f.write(reinterpret_cast<const char*>(&s.z), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&s.z),           sizeof(float));
+        f.write(reinterpret_cast<const char*>(&s.eval_target), sizeof(float));
     }
 }

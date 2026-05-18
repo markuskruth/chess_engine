@@ -41,10 +41,16 @@ class CNNNet(nn.Module):
         self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1)
 
         # VALUE HEAD
-        self.value_conv = nn.Conv2d(channels, 16, kernel_size=1)
-        self.value_bn = nn.BatchNorm2d(16)
-        self.value_fc1 = nn.Linear(16 * 8 * 8, 128)
+        self.value_conv = nn.Conv2d(channels, 2, kernel_size=1)
+        self.value_bn = nn.BatchNorm2d(2)
+        self.value_fc1 = nn.Linear(2 * 8 * 8, 128)
         self.value_fc2 = nn.Linear(128, 1)
+
+        # AUXILIARY HEURISTIC HEAD
+        self.aux_conv = nn.Conv2d(channels, 16, kernel_size=1)
+        self.aux_bn = nn.BatchNorm2d(16)
+        self.aux_fc1 = nn.Linear(16 * 8 * 8, 128)
+        self.aux_fc2 = nn.Linear(128, 1)
 
     def forward(self, x):
         # x: (batch, 20, 8, 8)
@@ -64,4 +70,10 @@ class CNNNet(nn.Module):
         v = F.relu(self.value_fc1(v))
         v = torch.tanh(self.value_fc2(v))
 
-        return p, v
+        # AUXILIARY HEURISTIC
+        h = F.relu(self.aux_bn(self.aux_conv(x)))
+        h = h.view(h.size(0), -1)
+        h = F.relu(self.aux_fc1(h))
+        h = torch.tanh(self.aux_fc2(h))
+
+        return p, v, h

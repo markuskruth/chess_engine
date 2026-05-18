@@ -20,7 +20,7 @@
 //
 // Binary format written (readable by data_loader.py):
 //   Header:   uint32 num_samples | uint32 state_channels (20) | uint32 board_size (8)
-//   Per sample: float32[1280] state | float32[4672] pi | float32[1] z
+//   Per sample: float32[1280] state | float32[4672] pi | float32[1] z | float32[1] eval_target
 
 #include <iostream>
 #include <string>

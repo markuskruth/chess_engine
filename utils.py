@@ -96,6 +96,7 @@ class PrioritizedReplayBuffer:
         self.policy_indices  = np.zeros((capacity, _MAX_LEGAL),   dtype=np.uint16)
         self.policy_values   = np.zeros((capacity, _MAX_LEGAL),   dtype=np.float32)
         self.values          = np.zeros((capacity, 1),            dtype=np.float32)
+        self.eval_targets    = np.zeros((capacity, 1),            dtype=np.float32)
 
         self._tree = _SumTree(capacity)
 
@@ -104,7 +105,7 @@ class PrioritizedReplayBuffer:
 
     # ── Writing ───────────────────────────────────────────────────────────────
 
-    def add(self, state, policy, value):
+    def add(self, state, policy, value, eval_target=0.0):
         self.states[self.index] = state
         # Pack dense policy → sparse (nonzero entries only, zero-padded to _MAX_LEGAL)
         nz = np.nonzero(policy)[0]
@@ -115,7 +116,8 @@ class PrioritizedReplayBuffer:
         if k < _MAX_LEGAL:
             self.policy_indices[self.index, k:] = 0
             self.policy_values[self.index,  k:] = 0.0
-        self.values[self.index] = value
+        self.values[self.index]       = value
+        self.eval_targets[self.index] = eval_target
         # New entries get priority 1.0 so they are sampled at least once,
         # but do NOT inherit the historically-maximum priority — that would
         # cause every new batch of positions (especially after a buffer grow)
@@ -124,9 +126,11 @@ class PrioritizedReplayBuffer:
         self.index = (self.index + 1) % self.capacity
         self.size  = min(self.size + 1, self.capacity)
 
-    def add_batch(self, states, policies, values):
-        for s, p, v in zip(states, policies, values):
-            self.add(s, p, v)
+    def add_batch(self, states, policies, values, eval_targets=None):
+        if eval_targets is None:
+            eval_targets = np.zeros((len(states), 1), dtype=np.float32)
+        for s, p, v, h in zip(states, policies, values, eval_targets):
+            self.add(s, p, v, h)
 
     # ── Sparse policy helpers ─────────────────────────────────────────────────
 
@@ -171,6 +175,7 @@ class PrioritizedReplayBuffer:
             self.states[indices],
             self._unpack_policies(indices),
             self.values[indices],
+            self.eval_targets[indices],
             indices,
             is_weights.astype(np.float32),
         )
@@ -221,14 +226,17 @@ class PrioritizedReplayBuffer:
         new_policy_indices = np.zeros((new_capacity, _MAX_LEGAL),        dtype=np.uint16)
         new_policy_values  = np.zeros((new_capacity, _MAX_LEGAL),        dtype=np.float32)
         new_values         = np.zeros((new_capacity, 1),                 dtype=np.float32)
+        new_eval_targets   = np.zeros((new_capacity, 1),                 dtype=np.float32)
         new_states[:old_cap]         = self.states
         new_policy_indices[:old_cap] = self.policy_indices
         new_policy_values[:old_cap]  = self.policy_values
         new_values[:old_cap]         = self.values
+        new_eval_targets[:old_cap]   = self.eval_targets
         self.states         = new_states
         self.policy_indices = new_policy_indices
         self.policy_values  = new_policy_values
         self.values         = new_values
+        self.eval_targets   = new_eval_targets
 
         # ── Rebuild SumTree at new capacity ───────────────────────────────────
         # Copy old leaf priorities (slots 0..old_cap-1) into the new tree's leaf layer.

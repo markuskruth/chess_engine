@@ -27,13 +27,11 @@ from PySide6.QtWidgets import (
 
 from Agent      import MCTS, Node
 from ChessEnv   import ChessEnv
-from MCTS_simple import MCTS_simple
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BOARD_SIZE     = 600     # pixels
-NUM_SIM_NEURAL = 800     # simulations per AI move (neural); divisible by LEAF_BATCH
-NUM_SIM_SIMPLE = 5_000   # simulations per AI move (simple MCTS)
-LEAF_BATCH     = 8       # must match the value used during training
+NUM_SIM_NEURAL = 2560     # simulations per AI move (neural); divisible by LEAF_BATCH
+LEAF_BATCH     = 64       # must match the value used during training
 TOP_N          = 5       # move rows shown in the probability panel
 
 
@@ -335,17 +333,13 @@ class AIWorker(QThread):
     def __init__(
         self,
         board:              chess.Board,
-        ai_type:            str,
         model_state_dict:   Optional[dict] = None,
-        mcts_simple_agent:  Optional[MCTS_simple] = None,
         num_sim:            int  = NUM_SIM_NEURAL,
         leaf_batch:         int  = LEAF_BATCH,
     ) -> None:
         super().__init__()
         self.board             = board.copy()
-        self.ai_type           = ai_type
         self.model_state_dict  = model_state_dict
-        self.mcts_simple_agent = mcts_simple_agent
         self.num_sim           = num_sim
         self.leaf_batch        = leaf_batch
         self._cancel           = False
@@ -354,10 +348,7 @@ class AIWorker(QThread):
         self._cancel = True
 
     def run(self) -> None:
-        if self.ai_type == "neural":
-            self._run_neural()
-        else:
-            self._run_simple()
+        self._run_neural()
 
     # ── Neural ────────────────────────────────────────────────────────────────
 
@@ -403,14 +394,6 @@ class AIWorker(QThread):
             if self.board.legal_moves else None
         ))
 
-    # ── Simple ────────────────────────────────────────────────────────────────
-
-    def _run_simple(self) -> None:
-        move = self.mcts_simple_agent.best_move(self.board)
-        if not self._cancel:
-            self.move_ready.emit(move)
-
-
 # ── Setup Dialog ──────────────────────────────────────────────────────────────
 
 class SetupDialog(QDialog):
@@ -420,7 +403,6 @@ class SetupDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(340)
 
-        self.ai_type:     str          = "neural"
         self.human_color: chess.Color  = chess.WHITE
 
         layout = QVBoxLayout(self)
@@ -439,16 +421,6 @@ class SetupDialog(QDialog):
         lbl_sub.setStyleSheet("color:#888;")
         layout.addWidget(lbl_sub)
 
-        # Opponent type
-        ai_box    = QGroupBox("Opponent")
-        ai_layout = QVBoxLayout(ai_box)
-        self.radio_neural = QRadioButton("Neural MCTS  (uses trained model)")
-        self.radio_simple = QRadioButton("Simple MCTS  (pure tree search)")
-        self.radio_neural.setChecked(True)
-        ai_layout.addWidget(self.radio_neural)
-        ai_layout.addWidget(self.radio_simple)
-        layout.addWidget(ai_box)
-
         # Colour choice
         color_box    = QGroupBox("Play as")
         color_layout = QHBoxLayout(color_box)
@@ -466,7 +438,6 @@ class SetupDialog(QDialog):
         layout.addWidget(btn)
 
     def _on_start(self) -> None:
-        self.ai_type     = "neural" if self.radio_neural.isChecked() else "simple"
         self.human_color = chess.WHITE if self.radio_white.isChecked() else chess.BLACK
         self.accept()
 
@@ -474,16 +445,14 @@ class SetupDialog(QDialog):
 # ── Main Window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-    def __init__(self, ai_type: str, human_color: chess.Color) -> None:
+    def __init__(self, human_color: chess.Color) -> None:
         super().__init__()
-        self.ai_type     = ai_type
         self.human_color = human_color
         self.board       = chess.Board()
         self.ai_worker:  Optional[AIWorker] = None
 
-        self.mcts_agent:   Optional[MCTS]        = None
-        self.simple_agent: Optional[MCTS_simple] = None
-        self._model_info   = self._init_ai()
+        self.mcts_agent:  Optional[MCTS] = None
+        self._model_info  = self._init_ai()
         self._init_ui()
 
         # If human plays black the AI must move first — defer until window is shown
@@ -492,17 +461,13 @@ class MainWindow(QMainWindow):
     # ── Initialisation ────────────────────────────────────────────────────────
 
     def _init_ai(self) -> str:
-        if self.ai_type == "neural":
-            self.mcts_agent = MCTS(
-                buffer_size     = 1,
-                num_simulations = NUM_SIM_NEURAL,
-                leaf_batch_size = LEAF_BATCH,
-            )
-            fname = load_latest_model(self.mcts_agent)
-            return f"Loaded {fname}" if fname else "No checkpoint found — untrained model"
-        else:
-            self.simple_agent = MCTS_simple(num_simulations=NUM_SIM_SIMPLE)
-            return f"Simple MCTS  ({NUM_SIM_SIMPLE:,} simulations)"
+        self.mcts_agent = MCTS(
+            buffer_size     = 1,
+            num_simulations = NUM_SIM_NEURAL,
+            leaf_batch_size = LEAF_BATCH,
+        )
+        fname = load_latest_model(self.mcts_agent)
+        return f"Loaded {fname}" if fname else "No checkpoint found — untrained model"
 
     def _init_ui(self) -> None:
         self.setWindowTitle("Chess RL")
@@ -546,7 +511,7 @@ class MainWindow(QMainWindow):
         self.lbl_color = QLabel(f"You: {color_str}")
         self.lbl_color.setFont(QFont("Arial", 9))
 
-        self.lbl_ai = QLabel(f"AI:  {self.ai_type.capitalize()} MCTS")
+        self.lbl_ai = QLabel("AI:  Neural MCTS")
         self.lbl_ai.setFont(QFont("Arial", 9))
 
         self.lbl_model = QLabel(self._model_info)
@@ -609,23 +574,14 @@ class MainWindow(QMainWindow):
         self.lbl_thinking.setText("Thinking…")
         self.move_prob.clear()
 
-        if self.ai_type == "neural":
-            # Pass a CPU snapshot of the weights — safe to read from any thread
-            sd = {k: v.cpu() for k, v in self.mcts_agent.model.state_dict().items()}
-            self.ai_worker = AIWorker(
-                board            = self.board,
-                ai_type          = "neural",
-                model_state_dict = sd,
-                num_sim          = NUM_SIM_NEURAL,
-                leaf_batch       = LEAF_BATCH,
-            )
-        else:
-            self.ai_worker = AIWorker(
-                board             = self.board,
-                ai_type           = "simple",
-                mcts_simple_agent = self.simple_agent,
-                num_sim           = NUM_SIM_SIMPLE,
-            )
+        # Pass a CPU snapshot of the weights — safe to read from any thread
+        sd = {k: v.cpu() for k, v in self.mcts_agent.model.state_dict().items()}
+        self.ai_worker = AIWorker(
+            board            = self.board,
+            model_state_dict = sd,
+            num_sim          = NUM_SIM_NEURAL,
+            leaf_batch       = LEAF_BATCH,
+        )
 
         self.ai_worker.progress.connect(self._on_ai_progress)
         self.ai_worker.move_ready.connect(self._on_ai_move)
@@ -771,7 +727,7 @@ def main() -> None:
     if dialog.exec() != QDialog.Accepted:
         sys.exit(0)
 
-    window = MainWindow(dialog.ai_type, dialog.human_color)
+    window = MainWindow(dialog.human_color)
     window.show()
     sys.exit(app.exec())
 

@@ -10,6 +10,7 @@
 #            float32[1280]  encoded state  (20 × 8 × 8)
 #            float32[4672]  policy π
 #            float32[1]     value target z
+#            float32[1]     aux heuristic target (mover-relative, tanh-normalised)
 #
 # Returns numpy arrays that can be fed directly into ReplayBuffer.add_batch()
 # or converted to PyTorch tensors for training.
@@ -22,7 +23,7 @@ BOARD_SZ       = 8
 ACTION_DIM     = 4672
 
 _STATE_FLOATS  = STATE_CHANNELS * BOARD_SZ * BOARD_SZ  # 1280
-_FLOATS_PER_SAMPLE = _STATE_FLOATS + ACTION_DIM + 1    # 5953
+_FLOATS_PER_SAMPLE = _STATE_FLOATS + ACTION_DIM + 1 + 1  # 5954 (state + pi + z + eval_target)
 
 
 def load_binary_game_data(path: str):
@@ -36,9 +37,10 @@ def load_binary_game_data(path: str):
 
     Returns
     -------
-    states   : np.ndarray, shape (N, 20, 8, 8), dtype float32
-    policies : np.ndarray, shape (N, 4672),     dtype float32
-    values   : np.ndarray, shape (N, 1),        dtype float32
+    states       : np.ndarray, shape (N, 20, 8, 8), dtype float32
+    policies     : np.ndarray, shape (N, 4672),     dtype float32
+    values       : np.ndarray, shape (N, 1),        dtype float32
+    eval_targets : np.ndarray, shape (N, 1),        dtype float32
 
     Raises
     ------
@@ -73,6 +75,7 @@ def load_binary_game_data(path: str):
                 np.zeros((0, STATE_CHANNELS, BOARD_SZ, BOARD_SZ), dtype=np.float32),
                 np.zeros((0, ACTION_DIM),                          dtype=np.float32),
                 np.zeros((0, 1),                                   dtype=np.float32),
+                np.zeros((0, 1),                                   dtype=np.float32),
             )
 
         # ── Sample data (read all at once for efficiency) ─────────────────────
@@ -87,11 +90,13 @@ def load_binary_game_data(path: str):
 
     raw = np.frombuffer(raw_bytes, dtype="<f4").reshape(num_samples, _FLOATS_PER_SAMPLE)
 
-    states   = raw[:, :_STATE_FLOATS].reshape(num_samples, STATE_CHANNELS, BOARD_SZ, BOARD_SZ).copy()
-    policies = raw[:, _STATE_FLOATS : _STATE_FLOATS + ACTION_DIM].copy()
-    values   = raw[:, _STATE_FLOATS + ACTION_DIM :].copy()  # shape (N, 1)
+    _pi_end  = _STATE_FLOATS + ACTION_DIM
+    states       = raw[:, :_STATE_FLOATS].reshape(num_samples, STATE_CHANNELS, BOARD_SZ, BOARD_SZ).copy()
+    policies     = raw[:, _STATE_FLOATS : _pi_end].copy()
+    values       = raw[:, _pi_end      : _pi_end + 1].copy()   # shape (N, 1)
+    eval_targets = raw[:, _pi_end + 1  : _pi_end + 2].copy()   # shape (N, 1)
 
-    return states, policies, values
+    return states, policies, values, eval_targets
 
 
 def load_into_buffer(path: str, buffer):
@@ -107,7 +112,7 @@ def load_into_buffer(path: str, buffer):
     -------
     int  number of samples loaded
     """
-    states, policies, values = load_binary_game_data(path)
+    states, policies, values, eval_targets = load_binary_game_data(path)
     if len(states) > 0:
-        buffer.add_batch(states, policies, values)
+        buffer.add_batch(states, policies, values, eval_targets)
     return len(states)

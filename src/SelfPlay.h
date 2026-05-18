@@ -16,14 +16,16 @@
 //             uint32 state_channels   (always 20)
 //             uint32 board_size       (always 8)
 //   Per sample (repeated num_samples times):
-//             float32[20*8*8]  encoded state     (1280 floats)
-//             float32[4672]    policy target pi  (4672 floats)
+//             float32[20*8*8]  encoded state            (1280 floats)
+//             float32[4672]    policy target pi          (4672 floats)
 //             float32[1]       value target z
+//             float32[1]       aux heuristic target h   (tanh-normalised, mover-relative)
 
 struct Sample {
     std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;  // 1280
     std::array<float, ACTION_DIM>                            pi;     // 4672
     float                                                    z;
+    float                                                    eval_target;  // mover-relative heuristic in [-1, 1]
 };
 
 struct GameMeta {

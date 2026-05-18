@@ -114,7 +114,7 @@ class MCTS:
 
         state_tensor = torch.FloatTensor(node.state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            p, v = self.model(state_tensor)
+            p, v, _ = self.model(state_tensor)
 
         p = p.cpu().numpy().flatten()
         v = v.cpu().numpy().item()
@@ -204,7 +204,7 @@ class MCTS:
             self._leaf_batch_buf[i] = leaf.state
         states_t = torch.from_numpy(self._leaf_batch_buf).to(self.device, non_blocking=True)
         with torch.no_grad():
-            p_batch, v_batch = self.model(states_t)
+            p_batch, v_batch, _ = self.model(states_t)
 
         p_batch = p_batch.cpu().numpy().reshape(self.leaf_batch_size, -1)  # (B, 4672)
         v_batch = v_batch.cpu().numpy().flatten()                           # (B,)
@@ -251,29 +251,33 @@ class MCTS:
                 node.total_N    += 1
 
 
-    def train_network(self, num_batches):
-        total_vl = total_pl = 0.0
+    def train_network(self, num_batches, lambda_aux=0.0):
+        total_vl = total_pl = total_al = 0.0
         for _ in range(num_batches):
-            states, target_pis, target_vs, indices, is_weights = \
+            states, target_pis, target_vs, target_hs, indices, is_weights = \
                 self.memory.sample(batch_size=self.batch_size)
 
             # Zero-copy numpy→tensor path; non_blocking overlaps GPU transfer (Fix #7)
             states_tensor     = torch.from_numpy(states).to(self.device, non_blocking=True)
             target_pis_tensor = torch.from_numpy(target_pis).to(self.device, non_blocking=True)
             target_vs_tensor  = torch.from_numpy(target_vs).to(self.device, non_blocking=True)
+            target_hs_tensor  = torch.from_numpy(target_hs).to(self.device, non_blocking=True)
             is_weights_tensor = torch.from_numpy(is_weights).to(self.device, non_blocking=True)
 
             with torch.autocast(device_type=self.device.type):
-                pred_p, pred_v = self.model(states_tensor)
+                pred_p, pred_v, pred_h = self.model(states_tensor)
                 pred_p = pred_p.view(pred_p.size(0), -1)
 
                 # Per-sample losses (shape: [batch])
                 value_loss_per  = (pred_v - target_vs_tensor).pow(2).squeeze(1)
                 log_probs       = torch.log_softmax(pred_p, dim=1)
                 policy_loss_per = -(target_pis_tensor * log_probs).sum(dim=1)
+                aux_loss_per    = (pred_h - target_hs_tensor).pow(2).squeeze(1)
 
                 # IS-weighted mean — corrects for non-uniform sampling bias
-                loss = (is_weights_tensor * (value_loss_per + policy_loss_per)).mean()
+                # Aux loss uses plain mean (no IS weighting — it is a curriculum signal)
+                loss = (is_weights_tensor * (value_loss_per + policy_loss_per)).mean() \
+                       + lambda_aux * aux_loss_per.mean()
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -287,10 +291,12 @@ class MCTS:
 
             total_vl += value_loss_per.mean().item()
             total_pl += policy_loss_per.mean().item()
+            total_al += aux_loss_per.mean().item()
 
         return {
             "value_loss":  total_vl / num_batches,
             "policy_loss": total_pl / num_batches,
+            "aux_loss":    total_al / num_batches,
             "total_loss":  (total_vl + total_pl) / num_batches,
         }
 
@@ -416,7 +422,7 @@ def _per_target_capacity(ep_0indexed):
     return min(_PER_INITIAL_CAP + steps * _PER_CAP_STEP, _PER_MAX_CAP)
 
 
-def _save_buffer_bg(states, policy_indices, policy_values, values, index, size, path, tree):
+def _save_buffer_bg(states, policy_indices, policy_values, values, eval_targets, index, size, path, tree):
     """Background thread target: compress and write the replay buffer."""
     np.savez_compressed(
         path,
@@ -424,10 +430,28 @@ def _save_buffer_bg(states, policy_indices, policy_values, values, index, size, 
         policy_indices=policy_indices,
         policy_values=policy_values,
         values=values,
+        eval_targets=eval_targets,
         index=np.array(index),
         size=np.array(size),
         tree=tree,
     )
+
+
+def _get_lambda_aux(ep_1indexed):
+    """Auxiliary loss curriculum weight schedule.
+
+    Episodes  1-20 : λ = 1.0  (strong heuristic guidance)
+    Episodes 21-40 : linearly decay 1.0 → 0.0
+    Episodes  41+  : λ = 0.0  (aux head mathematically severed)
+    """
+    full_lambda_cutoff = 50
+    lambda_zero_cutoff = 100
+    if ep_1indexed <= full_lambda_cutoff:
+        return 1.0
+    elif ep_1indexed <= lambda_zero_cutoff:
+        return 1.0 - (ep_1indexed - full_lambda_cutoff) / float(lambda_zero_cutoff - full_lambda_cutoff)
+    else:
+        return 0.0
 
 
 def run_training_parallel_hybrid(
@@ -496,6 +520,10 @@ def run_training_parallel_hybrid(
                 else:
                     print("  WARNING: old dense-policy checkpoint — policies will be empty")
                 mcts.memory.values[:n] = data["values"]
+                if "eval_targets" in data:
+                    mcts.memory.eval_targets[:n] = data["eval_targets"]
+                else:
+                    mcts.memory.eval_targets[:n] = 0.0  # old checkpoint — default to zero
                 mcts.memory.index        = int(data["index"])
                 mcts.memory.size         = n
                 if "tree" in data:
@@ -557,9 +585,9 @@ def run_training_parallel_hybrid(
     # Raw targets are rounded up to the nearest multiple of leaf_batch_size so
     # the C++ runner's divisibility requirement is always satisfied.
     _SIM_SCHEDULE = [
-        (50, 50),
-        (90, 100),
-        (250, 200),
+        (50, 100),
+        (200, 200),
+        (300, 300),
         (float("inf"), num_simulations),  # full depth for the rest of training
     ]
 
@@ -684,8 +712,8 @@ def run_training_parallel_hybrid(
             if save_thread is not None:
                 save_thread.join()
 
-            states, policies, values = load_binary_game_data(game_file)
-            mcts.memory.add_batch(states, policies, values)
+            states, policies, values, eval_targets = load_binary_game_data(game_file)
+            mcts.memory.add_batch(states, policies, values, eval_targets)
             total_positions = len(states)
             print(f"  Loaded     {total_positions} positions from {game_file}")
 
@@ -698,15 +726,18 @@ def run_training_parallel_hybrid(
         # ── 4. Train on GPU ───────────────────────────────────────────────────
         # Anneal PER beta from 0.4 → 1.0 over the full training run
         mcts.memory.set_beta(0.4 + 0.6 * (ep - start_ep) / max(episodes - start_ep - 1, 1))
+        lam_aux  = _get_lambda_aux(ep + 1)
         tr_start = time.time()
         losses = {}
         if len(mcts.memory) >= batch_size * train_batches:
             mcts.model.train() # Switch model to train mode
-            losses = mcts.train_network(num_batches=train_batches)
+            losses = mcts.train_network(num_batches=train_batches, lambda_aux=lam_aux)
             tr_time = time.time() - tr_start
+            aux_str = f"  aux {losses['aux_loss']:.4f}" if lam_aux > 0 else ""
             print(f"  Training   {train_batches} batches | "
                   f"val {losses['value_loss']:.4f}  "
-                  f"pol {losses['policy_loss']:.4f}  "
+                  f"pol {losses['policy_loss']:.4f}{aux_str}  "
+                  f"λ_aux={lam_aux:.2f}  "
                   f"total {losses['total_loss']:.4f} | {fmt_time(tr_time)}")
         else:
             print(f"  Training   skipped (buffer {len(mcts.memory)} < batch {batch_size})")
@@ -744,6 +775,7 @@ def run_training_parallel_hybrid(
                 mcts.memory.policy_indices[:n],
                 mcts.memory.policy_values[:n],
                 mcts.memory.values[:n],
+                mcts.memory.eval_targets[:n],
                 mcts.memory.index,
                 n,
                 "buffer_latest.npz",
@@ -852,7 +884,7 @@ def run_benchmark(current_model_path="checkpoint_latest.pt",
     print("=" * 44)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__a":
     # You can change the model_path to point to whichever .pt file you want to test
     run_benchmark(
     current_model_path="checkpoint_latest.pt",
@@ -863,7 +895,7 @@ if __name__ == "__main__":
 )
 
 # TODO: Maybe drop learning rate to 0.0001
-if __name__ == "__main__z":
+if __name__ == "__main__":
     # ── Hybrid training (C++ self-play + Python training) ─────────────────────
     # Requires a compiled selfplay.exe.  Build with:
     #   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release

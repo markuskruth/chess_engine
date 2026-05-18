@@ -153,7 +153,8 @@ void ParallelSelfPlay::worker_fn(int num_games, EvalQueue* queue) {
                                         s.state.size() * sizeof(float));
                         out_file_.write(reinterpret_cast<const char*>(s.pi.data()),
                                         s.pi.size() * sizeof(float));
-                        out_file_.write(reinterpret_cast<const char*>(&s.z), sizeof(float));
+                        out_file_.write(reinterpret_cast<const char*>(&s.z),           sizeof(float));
+                        out_file_.write(reinterpret_cast<const char*>(&s.eval_target), sizeof(float));
                     }
                     total_samples_written_ += static_cast<uint32_t>(samples.size());
                 }
@@ -190,6 +191,7 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
         std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;
         std::array<float, ACTION_DIM>                            pi;
         chess::Color                                             turn;
+        float                                                    eval_white;  // heuristic from White's perspective
     };
     std::vector<TrajEntry> traj;
     traj.reserve(cfg_.max_moves);
@@ -254,12 +256,13 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
             }
         }
 
-        // Encode and store state for this ply (no torch allocation).
+        // Encode and store state + heuristic eval for this ply (no torch allocation).
         {
             TrajEntry entry;
             ChessEnv::encode_state_into(board, entry.state.data());
-            entry.pi   = pi;
-            entry.turn = turn;
+            entry.pi         = pi;
+            entry.turn       = turn;
+            entry.eval_white = ChessEnv::get_evaluation(board);
             traj.push_back(entry);
         }
 
@@ -284,14 +287,15 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
         // z = 0.0f, outcome = "limit" (already set above)
     }
 
-    // Build samples: flip z so it is always from the perspective of the mover.
+    // Build samples: flip z and eval_target so both are mover-relative.
     std::vector<Sample> samples;
     samples.reserve(traj.size());
     for (const auto& e : traj) {
         Sample s;
-        s.state = e.state;
-        s.pi    = e.pi;
-        s.z     = (e.turn == chess::Color::WHITE) ? z : -z;
+        s.state       = e.state;
+        s.pi          = e.pi;
+        s.z           = (e.turn == chess::Color::WHITE) ? z : -z;
+        s.eval_target = (e.turn == chess::Color::WHITE) ? e.eval_white : -e.eval_white;
         samples.push_back(s);
     }
 
