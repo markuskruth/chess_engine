@@ -552,12 +552,6 @@ class ChessEnv:
             return False, mover
 
 
-    # LEGAL ACTIONS
-    @staticmethod
-    def get_legal_actions(self):
-        return list(self.board.legal_moves)
-
-    
     # LEGAL ACTION MASK
     @staticmethod
     def get_action_mask(state=None, board=None):
@@ -633,23 +627,6 @@ class ChessEnv:
 
         return mask
 
-    # STEP FUNCTION
-    @staticmethod
-    def step(board, action_idx):
-        """
-        action: (8x8x73)
-        """
-
-        valid_action = ChessEnv.apply_action(action_idx, board)
-        if not valid_action:
-            raise ValueError("Illegal move")
-
-        done = board.is_game_over()
-        reward = ChessEnv.get_reward()
-
-        return ChessEnv.get_state(), reward, done, {}
-
-
     # REWARD FUNCTION
     @staticmethod
     def get_reward(board):
@@ -665,10 +642,3 @@ class ChessEnv:
             return 10 if just_moved == chess.BLACK else -10
         else:
             return 0
-
-    def render(self):
-        print(self.board)
-    
-    def get_state(self):
-        """Return encoded state from the current board."""
-        return ChessEnv.encode_state(self.board)
