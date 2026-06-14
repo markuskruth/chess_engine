@@ -1,0 +1,8 @@
+# Python dependencies for the chess RL engine.
+# Everything else used (os, sys, csv, struct, threading, gc, subprocess,
+# datetime, pathlib, tempfile, typing) is in the standard library.
+
+torch          # neural network training/inference + TorchScript export
+numpy          # state/policy arrays, replay buffer
+python-chess   # board representation, move generation, SVG rendering (import: chess)
+PySide6        # GUI in main.py (only needed to play/test the model interactively)
