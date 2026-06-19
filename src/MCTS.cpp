@@ -198,14 +198,21 @@ void MCTS::run_simulation_batch(Node& root, int leaf_batch_size) {
         p_batch = out->elements()[0].toTensor()
                      .to(torch::kCPU).contiguous()
                      .reshape({leaf_batch_size, ACTION_DIM});
-        // value:  (B, 1) → (B,)
+        // value: WDL logits [win, draw, loss] → (B, 3)
         v_batch = out->elements()[1].toTensor()
                      .to(torch::kCPU).contiguous()
-                     .reshape({leaf_batch_size});
+                     .reshape({leaf_batch_size, 3});
     }
 
-    float* p_data = p_batch.data_ptr<float>();
-    float* v_data = v_batch.data_ptr<float>();
+    float* p_data   = p_batch.data_ptr<float>();
+    float* wdl_data = v_batch.data_ptr<float>();
+
+    // Convert each leaf's WDL logits to the scalar backup value P(win) - P(loss).
+    std::vector<float> v_scalar(leaf_batch_size);
+    for (int i = 0; i < leaf_batch_size; ++i) {
+        const float* w = wdl_data + i * 3;
+        v_scalar[i] = wdl_logits_to_value(w[0], w[1], w[2]);
+    }
 
     // ── EXPAND + BACKPROP ─────────────────────────────────────────────────────
     for (int i = 0; i < leaf_batch_size; ++i) {
@@ -221,12 +228,12 @@ void MCTS::run_simulation_batch(Node& root, int leaf_batch_size) {
                 leaf->is_expanded = true;
             } else {
                 // Normal leaf: expand with NN priors
-                value = expand(*leaf, p_data + i * ACTION_DIM, v_data[i]);
+                value = expand(*leaf, p_data + i * ACTION_DIM, v_scalar[i]);
             }
         } else {
             // Duplicate path in same batch: re-use NN value (or exact for terminals)
             auto go = ChessEnv::game_over(leaf->board);
-            value = go.first ? (go.second ? -1.0f : 0.0f) : v_data[i];
+            value = go.first ? (go.second ? -1.0f : 0.0f) : v_scalar[i];
         }
 
         backpropagate(all_paths[i], value);

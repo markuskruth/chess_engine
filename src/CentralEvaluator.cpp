@@ -162,14 +162,17 @@ void CentralEvaluator::process_batch(std::vector<EvalRequest>& batch) {
                      .to(torch::kCPU).contiguous()
                      .reshape({B, ACTION_DIM});
 
+        // Value head now emits WDL logits [win, draw, loss] → shape (B, 3).
         v_batch = out->elements()[1].toTensor()
                      .slice(0, 0, B)
                      .to(torch::kCPU).contiguous()
-                     .reshape({B});
+                     .reshape({B, 3});
+        // Note: out->elements()[2] (moves-left head) is a training-only auxiliary
+        // target and is intentionally not consumed during search.
     }
 
-    const float* p_data = p_batch.data_ptr<float>();
-    const float* v_data = v_batch.data_ptr<float>();
+    const float* p_data   = p_batch.data_ptr<float>();
+    const float* wdl_data = v_batch.data_ptr<float>();
 
     // 3. Fulfill the promises
     for (int i = 0; i < B; ++i) {
@@ -177,7 +180,8 @@ void CentralEvaluator::process_batch(std::vector<EvalRequest>& batch) {
         std::memcpy(res.policy.data(),
                     p_data + i * ACTION_DIM,
                     ACTION_DIM * sizeof(float));
-        res.value = v_data[i];
+        const float* w = wdl_data + i * 3;
+        res.value = wdl_logits_to_value(w[0], w[1], w[2]);  // P(win) - P(loss), scalar in [-1,1]
         batch[i].promise.set_value(std::move(res));
     }
 }

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from ChessEnv import ChessEnv
@@ -15,6 +16,14 @@ import os
 import time
 import threading
 import gc
+
+
+# ── Moves-left auxiliary head ──────────────────────────────────────────────────
+# The moves-left head regresses (plies remaining to game end) / _MOVES_LEFT_SCALE.
+# C++ self-play stores the raw ply count in each sample's auxiliary slot (the field
+# historically called `eval_target`, formerly the PeSTO heuristic).
+_MOVES_LEFT_SCALE  = 100.0   # normalize a full game's plies to O(1)
+_MOVES_LEFT_WEIGHT = 0.15    # weight of the moves-left MSE term in the total loss
 
 
 class Node:
@@ -122,7 +131,11 @@ class MCTS:
             self._leaf_batch_buf[i] = leaf.state
         states_t = torch.from_numpy(self._leaf_batch_buf).to(self.device, non_blocking=True)
         with torch.no_grad():
-            p_batch, v_batch, _ = self.model(states_t)
+            p_batch, wdl_batch, _ = self.model(states_t)
+            # WDL logits (B, 3) → scalar backup value P(win) - P(loss), matching the
+            # C++ wdl_logits_to_value() convention. (Head [2] = moves-left, unused here.)
+            wdl_prob = torch.softmax(wdl_batch.float(), dim=1)
+            v_batch  = wdl_prob[:, 0] - wdl_prob[:, 2]
 
         p_batch = p_batch.cpu().numpy().reshape(self.leaf_batch_size, -1)  # (B, 4672)
         v_batch = v_batch.cpu().numpy().flatten()                           # (B,)
@@ -169,8 +182,8 @@ class MCTS:
                 node.total_N    += 1
 
 
-    def train_network(self, num_batches, lambda_aux=0.0):
-        total_vl = total_pl = total_al = 0.0
+    def train_network(self, num_batches, ml_weight=_MOVES_LEFT_WEIGHT):
+        total_vl = total_pl = total_ml = 0.0
         for _ in range(num_batches):
             states, target_pis, target_vs, target_hs, indices, is_weights = \
                 self.memory.sample(batch_size=self.batch_size)
@@ -183,38 +196,52 @@ class MCTS:
             is_weights_tensor = torch.from_numpy(is_weights).to(self.device, non_blocking=True)
 
             with torch.autocast(device_type=self.device.type):
-                pred_p, pred_v, pred_h = self.model(states_tensor)
+                # pred_wdl: (B, 3) logits [win, draw, loss];  pred_ml: (B, 1) moves-left
+                pred_p, pred_wdl, pred_ml = self.model(states_tensor)
                 pred_p = pred_p.view(pred_p.size(0), -1)
 
-                # Per-sample losses (shape: [batch])
-                value_loss_per  = (pred_v - target_vs_tensor).pow(2).squeeze(1)
+                # ── VALUE: WDL cross-entropy ──────────────────────────────────
+                # Derive the W/D/L class from the mover-relative outcome z ∈ {-1,0,1}.
+                z_flat = target_vs_tensor.squeeze(1)
+                wdl_target = torch.ones_like(z_flat, dtype=torch.long)   # 1 = draw
+                wdl_target[z_flat >  0.5] = 0                            # 0 = win
+                wdl_target[z_flat < -0.5] = 2                            # 2 = loss
+                value_loss_per = F.cross_entropy(pred_wdl, wdl_target, reduction="none")  # (B,)
+
+                # ── POLICY: cross-entropy vs MCTS visit-count target ──────────
                 log_probs       = torch.log_softmax(pred_p, dim=1)
                 policy_loss_per = -(target_pis_tensor * log_probs).sum(dim=1)
-                aux_loss_per    = (pred_h - target_hs_tensor).pow(2).squeeze(1)
 
-                # IS-weighted mean — corrects for non-uniform sampling bias
-                # Aux loss uses plain mean (no IS weighting — it is a curriculum signal)
+                # ── MOVES-LEFT: MSE on normalized plies remaining ─────────────
+                ml_target   = target_hs_tensor.squeeze(1) / _MOVES_LEFT_SCALE
+                ml_loss_per = (pred_ml.squeeze(1) - ml_target).pow(2)
+
+                # IS-weighted value+policy (corrects PER sampling bias);
+                # moves-left is a plain-mean auxiliary regularizer.
                 loss = (is_weights_tensor * (value_loss_per + policy_loss_per)).mean() \
-                       + lambda_aux * aux_loss_per.mean()
+                       + ml_weight * ml_loss_per.mean()
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            # Update priorities using absolute value-head error (analogous to TD error)
+            # PER priority = |E[outcome] - z|, with E[outcome] = P(win) - P(loss)
+            # (the WDL analogue of the previous |pred_v - z| value-error priority).
             with torch.no_grad():
-                td_errors = value_loss_per.detach().float().sqrt().cpu().numpy()
+                wdl_prob  = torch.softmax(pred_wdl.float(), dim=1)
+                scalar_v  = wdl_prob[:, 0] - wdl_prob[:, 2]
+                td_errors = (scalar_v - z_flat).abs().cpu().numpy()
             self.memory.update_priorities(indices, td_errors)
 
             total_vl += value_loss_per.mean().item()
             total_pl += policy_loss_per.mean().item()
-            total_al += aux_loss_per.mean().item()
+            total_ml += ml_loss_per.mean().item()
 
         return {
-            "value_loss":  total_vl / num_batches,
+            "value_loss":  total_vl / num_batches,   # WDL cross-entropy
             "policy_loss": total_pl / num_batches,
-            "aux_loss":    total_al / num_batches,
+            "ml_loss":     total_ml / num_batches,   # moves-left MSE (normalized)
             "total_loss":  (total_vl + total_pl) / num_batches,
         }
 
@@ -649,18 +676,16 @@ def run_training_parallel_hybrid(
         # ── 4. Train on GPU ───────────────────────────────────────────────────
         # Anneal PER beta from 0.4 → 1.0 over the full training run
         mcts.memory.set_beta(0.4 + 0.6 * (ep - start_ep) / max(episodes - start_ep - 1, 1))
-        lam_aux  = _get_lambda_aux(ep + 1)
         tr_start = time.time()
         losses = {}
         if len(mcts.memory) >= batch_size * train_batches:
             mcts.model.train() # Switch model to train mode
-            losses = mcts.train_network(num_batches=train_batches, lambda_aux=lam_aux)
+            losses = mcts.train_network(num_batches=train_batches, ml_weight=_MOVES_LEFT_WEIGHT)
             tr_time = time.time() - tr_start
-            aux_str = f"  aux {losses['aux_loss']:.4f}" if lam_aux > 0 else ""
             print(f"  Training   {train_batches} batches | "
-                  f"val {losses['value_loss']:.4f}  "
-                  f"pol {losses['policy_loss']:.4f}{aux_str}  "
-                  f"λ_aux={lam_aux:.2f}  "
+                  f"val(WDL-CE) {losses['value_loss']:.4f}  "
+                  f"pol {losses['policy_loss']:.4f}  "
+                  f"ml {losses['ml_loss']:.4f}  "
                   f"total {losses['total_loss']:.4f} | {fmt_time(tr_time)}")
         else:
             print(f"  Training   skipped (buffer {len(mcts.memory)} < batch {batch_size})")

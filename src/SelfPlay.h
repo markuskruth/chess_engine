@@ -25,7 +25,7 @@ struct Sample {
     std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;  // 1280
     std::array<float, ACTION_DIM>                            pi;     // 4672
     float                                                    z;
-    float                                                    eval_target;  // mover-relative heuristic in [-1, 1]
+    float                                                    eval_target;  // auxiliary target slot: moves-left = plies remaining to game end (perspective-independent)
 };
 
 struct GameMeta {

@@ -95,44 +95,62 @@ def load_latest_model(agent: MCTS) -> Optional[str]:
 
 class EvalBar(QWidget):
     """
-    Thin vertical bar: black fills from the top, white fills from the bottom.
-    value in [-1, 1]:  +1 = white winning,  -1 = black winning.
+    Vertical Win/Draw/Loss bar — the model's value head, ALWAYS from White's
+    perspective. Three stacked segments (top → bottom):
+        Black (top)    = White's loss probability
+        Gray (middle)  = draw probability
+        White (bottom) = White's win probability
+    Segment heights are proportional to the predicted W/D/L percentages.
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._value: float = 0.0
-        self.setFixedWidth(22)
+        # Neutral (all-draw) until the first model evaluation.
+        self._w: float = 0.0
+        self._d: float = 1.0
+        self._l: float = 0.0
+        self.setFixedWidth(28)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self.setToolTip("Position evaluation  (W = white advantage, B = black advantage)")
+        self.setToolTip("Model WDL prediction (White's perspective)")
 
-    def set_value(self, v: float) -> None:
-        self._value = max(-1.0, min(1.0, float(v)))
+    def set_wdl(self, win: float, draw: float, loss: float) -> None:
+        """Set the bar from White-perspective win/draw/loss probabilities."""
+        s = win + draw + loss
+        if s <= 0.0:
+            win, draw, loss, s = 0.0, 1.0, 0.0, 1.0
+        self._w, self._d, self._l = win / s, draw / s, loss / s
+        self.setToolTip(
+            f"Model prediction (White's view) — "
+            f"Win {self._w * 100:.0f}%   Draw {self._d * 100:.0f}%   "
+            f"Loss {self._l * 100:.0f}%"
+        )
         self.update()
 
     def paintEvent(self, _event) -> None:
-        p   = QPainter(self)
-        w   = self.width()
-        h   = self.height()
+        p = QPainter(self)
+        w = self.width()
+        h = self.height()
 
-        # Background = black player's colour
-        p.fillRect(0, 0, w, h, QColor(30, 30, 30))
+        # top → bottom: Black (White's loss), Gray (draw), White (White's win).
+        loss_h = round(self._l * h)
+        draw_h = round(self._d * h)
+        win_h  = h - loss_h - draw_h            # remainder absorbs rounding → no gaps
 
-        # White portion grows from bottom
-        white_h = int((self._value + 1.0) / 2.0 * h)
-        p.fillRect(0, h - white_h, w, white_h, QColor(225, 225, 225))
+        p.fillRect(0, 0,               w, loss_h, QColor(30, 30, 30))
+        p.fillRect(0, loss_h,          w, draw_h, QColor(120, 120, 120))
+        p.fillRect(0, loss_h + draw_h, w, win_h,  QColor(235, 235, 235))
 
-        # Centre divider
-        p.setPen(QPen(QColor(110, 110, 110), 1))
-        p.drawLine(0, h // 2, w, h // 2)
+        # Percentage labels, drawn only where a segment is tall enough to read.
+        p.setFont(QFont("Arial", 7, QFont.Bold))
 
-        # Labels
-        font = QFont("Arial", 7, QFont.Bold)
-        p.setFont(font)
-        p.setPen(QColor(200, 200, 200))
-        p.drawText(0, 2, w, 14, Qt.AlignHCenter, "B")
-        p.setPen(QColor(80, 80, 80))
-        p.drawText(0, h - 14, w, 14, Qt.AlignHCenter, "W")
+        def _label(y0: int, hh: int, frac: float, fg: QColor) -> None:
+            if hh >= 13:
+                p.setPen(fg)
+                p.drawText(0, y0, w, hh, Qt.AlignCenter, f"{frac * 100:.0f}%")
+
+        _label(0,               loss_h, self._l, QColor(215, 215, 215))  # on black
+        _label(loss_h,          draw_h, self._d, QColor(20, 20, 20))     # on gray
+        _label(loss_h + draw_h, win_h,  self._w, QColor(20, 20, 20))     # on white
 
 
 # ── Move Probability Panel ────────────────────────────────────────────────────
@@ -454,6 +472,7 @@ class MainWindow(QMainWindow):
         self.mcts_agent:  Optional[MCTS] = None
         self._model_info  = self._init_ai()
         self._init_ui()
+        self._update_eval()          # show the model's eval of the initial position
 
         # If human plays black the AI must move first — defer until window is shown
         QTimer.singleShot(200, self._maybe_trigger_ai)
@@ -636,12 +655,36 @@ class MainWindow(QMainWindow):
 
     # ── UI updates ────────────────────────────────────────────────────────────
 
+    def _model_wdl_white(self) -> tuple:
+        """Model's WDL prediction as (win, draw, loss) from WHITE's perspective.
+
+        The value head is mover-relative — logits [win, draw, loss] for the side to
+        move. To express it from White's view we swap win↔loss when Black is to move
+        (Black winning == White losing); draw is unchanged.
+        """
+        agent = self.mcts_agent
+        state = ChessEnv.encode_state(self.board)                  # mover-relative (20,8,8)
+        x = torch.from_numpy(state).unsqueeze(0).to(agent.device)  # (1,20,8,8)
+        agent.model.eval()                                         # BN running stats (batch=1)
+        with torch.no_grad():
+            _, wdl_logits, _ = agent.model(x)                      # (1,3) logits
+            probs = torch.softmax(wdl_logits.float(), dim=1)[0]    # [win, draw, loss] (mover)
+            win_m, draw_m, loss_m = float(probs[0]), float(probs[1]), float(probs[2])
+        if self.board.turn == chess.WHITE:
+            return win_m, draw_m, loss_m
+        return loss_m, draw_m, win_m                               # swap for Black to move
+
     def _update_eval(self) -> None:
         if self.board.is_game_over():
             res = self.board.result()
-            self.eval_bar.set_value(1.0 if res == "1-0" else -1.0 if res == "0-1" else 0.0)
+            if   res == "1-0": self.eval_bar.set_wdl(1.0, 0.0, 0.0)   # White won
+            elif res == "0-1": self.eval_bar.set_wdl(0.0, 0.0, 1.0)   # White lost
+            else:              self.eval_bar.set_wdl(0.0, 1.0, 0.0)   # draw
+        elif self.mcts_agent is not None:
+            # Show the model's LEARNED W/D/L prediction (value head), White's view.
+            self.eval_bar.set_wdl(*self._model_wdl_white())
         else:
-            self.eval_bar.set_value(ChessEnv.get_evaluation(self.board))
+            self.eval_bar.set_wdl(0.0, 1.0, 0.0)                      # no model loaded
 
     def _update_status(self) -> None:
         b = self.board
@@ -698,7 +741,7 @@ class MainWindow(QMainWindow):
         self.move_prob.clear()
         self.lbl_thinking.setText("")
         self.lbl_status.setStyleSheet("")
-        self.eval_bar.set_value(0.0)
+        self._update_eval()          # show the model's eval of the fresh start position
         self._update_status()
         QTimer.singleShot(100, self._maybe_trigger_ai)
 

@@ -40,13 +40,16 @@ class CNNNet(nn.Module):
         # POLICY HEAD
         self.policy_conv = nn.Conv2d(channels, 73, kernel_size=1)
 
-        # VALUE HEAD
+        # VALUE HEAD — WDL: 3 logits [win, draw, loss], mover-relative.
+        # Raw logits (no activation here); softmax is applied downstream
+        # (cross-entropy in training; P(win)-P(loss) by the MCTS consumers).
         self.value_conv = nn.Conv2d(channels, 2, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(2)
         self.value_fc1 = nn.Linear(2 * 8 * 8, 128)
-        self.value_fc2 = nn.Linear(128, 1)
+        self.value_fc2 = nn.Linear(128, 3)
 
-        # AUXILIARY HEURISTIC HEAD
+        # MOVES-LEFT HEAD — scalar >= 0: normalized plies remaining to game end.
+        # (Replaces the former PeSTO-heuristic auxiliary head.)
         self.aux_conv = nn.Conv2d(channels, 16, kernel_size=1)
         self.aux_bn = nn.BatchNorm2d(16)
         self.aux_fc1 = nn.Linear(16 * 8 * 8, 128)
@@ -64,16 +67,16 @@ class CNNNet(nn.Module):
         p = p.permute(0, 2, 3, 1)        # Shape: (batch, 8, 8, 73)
         p = p.reshape(p.size(0), -1)     # Shape: (batch, 4672)
 
-        # VALUE
+        # VALUE — WDL logits, shape (batch, 3). No activation (softmax done downstream).
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.view(v.size(0), -1)
         v = F.relu(self.value_fc1(v))
-        v = torch.tanh(self.value_fc2(v))
+        v = self.value_fc2(v)
 
-        # AUXILIARY HEURISTIC
+        # MOVES-LEFT — shape (batch, 1), non-negative via softplus.
         h = F.relu(self.aux_bn(self.aux_conv(x)))
         h = h.view(h.size(0), -1)
         h = F.relu(self.aux_fc1(h))
-        h = torch.tanh(self.aux_fc2(h))
+        h = F.softplus(self.aux_fc2(h))
 
         return p, v, h

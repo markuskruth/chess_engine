@@ -11,6 +11,8 @@
 
 #include <array>
 #include <utility>
+#include <cmath>
+#include <algorithm>
 #include <torch/torch.h>
 #include "chess.hpp"
 
@@ -41,6 +43,20 @@ extern const std::array<chess::PieceType, 3> UNDERPROMO_PIECES;
 // ── Type aliases ──────────────────────────────────────────────────────────────
 using ActionMask = std::array<bool, ACTION_DIM>;
 using StateArray = std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ>; // 1280
+
+// ── WDL value-head decoding ───────────────────────────────────────────────────
+// The value head emits three raw logits [win, draw, loss] from the mover's
+// perspective. MCTS backs up a single scalar in [-1, 1]; the natural reduction is
+// the expected game outcome  value = P(win) - P(loss).  This is the single source
+// of truth for the WDL convention, shared by the sync (MCTS) and async
+// (CentralEvaluator) inference paths so they can never diverge.
+inline float wdl_logits_to_value(float l_win, float l_draw, float l_loss) {
+    const float m  = std::max(l_win, std::max(l_draw, l_loss));
+    const float ew = std::exp(l_win  - m);
+    const float ed = std::exp(l_draw - m);
+    const float el = std::exp(l_loss - m);
+    return (ew - el) / (ew + ed + el);
+}
 
 // ── ChessEnv namespace ────────────────────────────────────────────────────────
 namespace ChessEnv {

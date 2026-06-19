@@ -250,7 +250,6 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
         std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;
         std::array<float, ACTION_DIM>                            pi;
         chess::Color                                             turn;
-        float                                                    eval_white;  // heuristic from White's perspective
     };
     std::vector<TrajEntry> traj;
     traj.reserve(cfg_.max_moves);
@@ -315,13 +314,13 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
             }
         }
 
-        // Encode and store state + heuristic eval for this ply (no torch allocation).
+        // Encode and store state + policy for this ply (no torch allocation).
+        // The moves-left target is derived from the trajectory length after the game ends.
         {
             TrajEntry entry;
             ChessEnv::encode_state_into(board, entry.state.data());
-            entry.pi         = pi;
-            entry.turn       = turn;
-            entry.eval_white = ChessEnv::get_evaluation(board);
+            entry.pi   = pi;
+            entry.turn = turn;
             traj.push_back(entry);
         }
 
@@ -346,15 +345,19 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
         // z = 0.0f, outcome = "limit" (already set above)
     }
 
-    // Build samples: flip z and eval_target so both are mover-relative.
+    // Build samples. z is flipped to be mover-relative. The auxiliary slot now holds
+    // moves-left = plies remaining to game end (traj.size() - i): a perspective-
+    // independent count, so it is NOT flipped per side to move.
     std::vector<Sample> samples;
     samples.reserve(traj.size());
-    for (const auto& e : traj) {
+    const float total_plies = static_cast<float>(traj.size());
+    for (size_t i = 0; i < traj.size(); ++i) {
+        const auto& e = traj[i];
         Sample s;
         s.state       = e.state;
         s.pi          = e.pi;
         s.z           = (e.turn == chess::Color::WHITE) ? z : -z;
-        s.eval_target = (e.turn == chess::Color::WHITE) ? e.eval_white : -e.eval_white;
+        s.eval_target = total_plies - static_cast<float>(i);   // moves-left (raw plies)
         samples.push_back(s);
     }
 

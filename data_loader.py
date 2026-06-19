@@ -9,8 +9,11 @@
 #   Per sample (repeated num_samples times):
 #            float32[1280]  encoded state  (20 × 8 × 8)
 #            float32[4672]  policy π
-#            float32[1]     value target z
-#            float32[1]     aux heuristic target (mover-relative, tanh-normalised)
+#            float32[1]     value target z        (mover-relative: -1 / 0 / +1)
+#            float32[1]     moves-left target     (raw plies remaining to game end;
+#                                                  formerly the PeSTO aux heuristic.
+#                                                  Returned as `eval_targets` for
+#                                                  backward-compatible plumbing.)
 #
 # Returns numpy arrays that can be fed directly into ReplayBuffer.add_batch()
 # or converted to PyTorch tensors for training.
