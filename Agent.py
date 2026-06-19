@@ -369,23 +369,6 @@ def _save_buffer_bg(states, policy_indices, policy_values, values, eval_targets,
     )
 
 
-def _get_lambda_aux(ep_1indexed):
-    """Auxiliary loss curriculum weight schedule.
-
-    Episodes  1-20 : λ = 1.0  (strong heuristic guidance)
-    Episodes 21-40 : linearly decay 1.0 → 0.0
-    Episodes  41+  : λ = 0.0  (aux head mathematically severed)
-    """
-    full_lambda_cutoff = 50
-    lambda_zero_cutoff = 100
-    if ep_1indexed <= full_lambda_cutoff:
-        return 1.0
-    elif ep_1indexed <= lambda_zero_cutoff:
-        return 1.0 - (ep_1indexed - full_lambda_cutoff) / float(lambda_zero_cutoff - full_lambda_cutoff)
-    else:
-        return 0.0
-
-
 def run_training_parallel_hybrid(
     episodes,
     selfplay_exe="build/Release/selfplay.exe",
@@ -456,8 +439,23 @@ def run_training_parallel_hybrid(
                     mcts.memory.eval_targets[:n] = data["eval_targets"]
                 else:
                     mcts.memory.eval_targets[:n] = 0.0  # old checkpoint — default to zero
-                mcts.memory.index        = int(data["index"])
                 mcts.memory.size         = n
+                # Cursor relocation, mirroring PrioritizedReplayBuffer.grow():
+                # the data was restored contiguously into [0, n). If the buffer was
+                # FULL at its saved capacity AND we have since grown past it, the saved
+                # cursor points into still-valid data while the freshly-grown region
+                # [n, capacity) sits empty — leaving it there makes the next adds
+                # overwrite old history and never fill the new slots until they lap the
+                # entire old span (the resume-path form of the grow() cursor bug). Move
+                # the cursor to the start of the new region so growth actually enlarges
+                # the retained window. Otherwise keep the saved cursor (correct circular
+                # order when the capacity boundary did not move). saved_cap is recovered
+                # from the snapshot's SumTree length (2 * saved_capacity).
+                saved_cap = (len(data["tree"]) // 2) if "tree" in data else n
+                if n == saved_cap and mcts.memory.capacity > saved_cap:
+                    mcts.memory.index = saved_cap
+                else:
+                    mcts.memory.index = int(data["index"]) % mcts.memory.capacity
                 if "tree" in data:
                     mcts.memory.restore_tree(data["tree"])
                 else:
@@ -661,11 +659,15 @@ def run_training_parallel_hybrid(
             total_positions = 0
 
         # ── 4. Train on GPU ───────────────────────────────────────────────────
-        # Anneal PER beta from 0.4 → 1.0 over the full training run
-        mcts.memory.set_beta(0.4 + 0.6 * (ep - start_ep) / max(episodes - start_ep - 1, 1))
+        # Anneal PER beta from 0.4 → 1.0 over the full training run.
+        # Key on the ABSOLUTE episode (not ep - start_ep): beta must reflect total
+        # training progress, not progress since the last resume. Subtracting start_ep
+        # would snap beta back to 0.4 on every restart (and beta isn't checkpointed,
+        # so absolute keying is what makes it correctly self-restoring).
+        mcts.memory.set_beta(min(1.0, 0.4 + 0.6 * ep / max(episodes - 1, 1)))
         tr_start = time.time()
         losses = {}
-        if len(mcts.memory) >= batch_size * train_batches:
+        if len(mcts.memory) >= batch_size:
             mcts.model.train() # Switch model to train mode
             losses = mcts.train_network(num_batches=train_batches, ml_weight=_MOVES_LEFT_WEIGHT)
             tr_time = time.time() - tr_start
