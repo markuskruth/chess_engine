@@ -450,7 +450,12 @@ def run_training_parallel_hybrid(
                     mcts.memory.restore_uniform()
                 print(f"  Replay buffer restored: {n} positions")
             except Exception as e:
-                print(f"  WARNING: buffer_latest.npz corrupt ({e}), starting empty")
+                print(f"  WARNING: buffer_latest.npz unreadable ({e}) — starting with empty buffer")
+                # Actually reset to a clean, consistent empty state (the half-assigned
+                # data/size/index above must not be left behind with a stale tree).
+                mcts.memory.index = 0
+                mcts.memory.size  = 0
+                mcts.memory._tree.tree[:] = 0.0
 
     print(f"Device (training): {mcts.device}")
     print(f"Workers: {num_workers}  |  Games/episode: scheduled (400→200→{games_per_episode})")

@@ -200,8 +200,22 @@ class PrioritizedReplayBuffer:
         return self._tree.tree.copy()
 
     def restore_tree(self, tree_array):
-        """Restore priority tree from a saved snapshot."""
-        self._tree.tree[:] = tree_array
+        """Restore priority tree from a saved snapshot, tolerant of a capacity change
+        since the snapshot was taken.
+
+        tree_array is a full SumTree array of length 2*saved_capacity. We copy its
+        leaf layer into the current tree's leaf region and rebuild the internal nodes
+        (mirroring grow()), so a snapshot taken at a smaller capacity restores cleanly
+        into a buffer that has since been grown — instead of raising a broadcast
+        ValueError and leaving an all-zero priority tree.
+        """
+        tree_array   = np.asarray(tree_array, dtype=np.float64)
+        saved_cap    = len(tree_array) // 2
+        saved_leaves = tree_array[saved_cap:]            # priorities for slots 0..saved_cap-1
+        self._tree.tree[:] = 0.0
+        k = min(saved_cap, self.capacity)
+        self._tree.tree[self.capacity : self.capacity + k] = saved_leaves[:k]
+        self._tree._rebuild()
 
     def restore_uniform(self):
         """Assign priority 1.0 to all live entries (fallback for old checkpoints)."""
@@ -247,7 +261,17 @@ class PrioritizedReplayBuffer:
         self._tree = new_tree
 
         self.capacity = new_capacity
-        # self.index and self.size are unchanged — the circular buffer cursor is still valid
+
+        # Relocate the write cursor when the buffer was FULL at grow time.
+        # When full, self.index points at the oldest live entry inside [0, old_cap).
+        # Leaving it there makes the next adds overwrite still-valid data while the
+        # freshly allocated region [old_cap, new_capacity) sits empty and unsampled
+        # (priority 0) — defeating the replay-window-growth schedule. Move the cursor
+        # to the start of the new region so adds fill the new capacity first.
+        # (When the buffer was not yet full, index == size < old_cap and the cursor
+        # is already correct — appending continues straight into the new region.)
+        if self.size == old_cap:
+            self.index = old_cap
 
     # ── Misc ──────────────────────────────────────────────────────────────────
 

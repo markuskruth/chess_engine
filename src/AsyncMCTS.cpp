@@ -250,13 +250,23 @@ static void apply_dirichlet_noise(Node& root, float alpha, float epsilon,
 // submits batch N+1.  This eliminates the idle CPU time present in the naive
 // select→submit→wait→process loop.
 //
-// Safety: batch N+1 selection is done after N's virtual losses are applied but
-// before N's expand+backprop.  This is the same trade-off as ordinary batched
-// virtual loss and does not introduce data races (each worker owns its tree).
+// Root warm-up: selection on an UNEXPANDED root can only return the root itself
+// (empty paths → zero visits on backprop), so the very first batch cannot do real
+// tree search — it exists only to evaluate the root and populate root.P.  We flush
+// it synchronously (there is no CPU work to overlap until the root has priors) and
+// then inject Dirichlet noise once.  Only after that does pipelined selection
+// descend into real children.
 //
-// Dirichlet noise is applied to root.P after the first flush (when the root
-// has been expanded by the NN).  All subsequent batches search with the noisy
-// prior.  If epsilon == 0 noise is skipped entirely.
+// NOTE: the previous version selected the *second* batch before flushing the seed,
+// so that batch also hit the still-unexpanded root and was wasted too — burning two
+// batches (≈2·leaf_batch_size sims) per move instead of one.  Flushing the seed first
+// recovers one full batch of real visits at identical GPU cost and matches the
+// synchronous run_simulation_batch loop.
+//
+// Safety: within the pipeline, batch N+1 selection is done after N's virtual losses
+// are applied but before N's expand+backprop.  This is the same trade-off as ordinary
+// batched virtual loss and does not introduce data races (each worker owns its tree).
+// If epsilon == 0 (or there is no search budget past the warm-up) noise is skipped.
 
 void AsyncMCTS::run_simulations(Node& root, int num_simulations, int leaf_batch_size,
                                 float dirichlet_alpha, float dirichlet_epsilon) {
@@ -266,19 +276,21 @@ void AsyncMCTS::run_simulations(Node& root, int num_simulations, int leaf_batch_
     static thread_local std::mt19937 rng(std::random_device{}());
     const bool add_noise = (dirichlet_epsilon > 0.0f) && (num_batches >= 2);
 
-    // Seed: submit first batch (no CPU work to overlap yet).
-    PendingBatch cur = select_and_submit(root, leaf_batch_size);
+    // Warm-up batch: expand the root (no useful selection possible yet).
+    PendingBatch seed = select_and_submit(root, leaf_batch_size);
+    flush_pending(seed);                          // root is now expanded, root.P populated
+    if (add_noise)
+        apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_epsilon, rng);
 
-    for (int b = 1; b < num_batches; ++b) {
+    if (num_batches < 2) return;                  // no simulation budget left after warm-up
+
+    // Pipelined search over the remaining (num_batches - 1) batches.  The root is
+    // expanded, so every one of these batches descends into real children.
+    PendingBatch cur = select_and_submit(root, leaf_batch_size);
+    for (int b = 2; b < num_batches; ++b) {
         // Overlap: select + submit next batch while GPU evaluates current.
         PendingBatch nxt = select_and_submit(root, leaf_batch_size);
         flush_pending(cur);          // wait for current, expand + backprop
-
-        // After the first flush the root is expanded and root.P is populated.
-        // Apply Dirichlet noise once so all remaining batches use the noisy prior.
-        if (b == 1 && add_noise)
-            apply_dirichlet_noise(root, dirichlet_alpha, dirichlet_epsilon, rng);
-
         cur = std::move(nxt);
     }
 

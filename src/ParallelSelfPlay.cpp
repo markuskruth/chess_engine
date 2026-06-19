@@ -15,38 +15,101 @@
 #include <stdexcept>
 #include <thread>
 
-// ── Curriculum FENs ───────────────────────────────────────────────────────────
-// Used for episodes 1–5 instead of the standard start position.
-// Goals: generate decisive games early in training so the value head receives
-// non-zero reward signal from the very first episode.
+// ── Curriculum (Tier 1: strength-tracking difficulty ramp) ─────────────────────
 //
-// Mix of mate-in-1 positions (verified) and overwhelming material advantages
-// (K+2Q/K+2R/K+Q+R vs lone king, both White-wins and Black-wins variants).
+// Goal: keep the VALUE HEAD fed with TRUE decisive outcomes (real checkmates,
+// z = ±1) without ever putting the hand-made heuristic into the value target.
+// We do this by starting games from positions the network can convert AT ITS
+// CURRENT STRENGTH, ramping difficulty by *mate distance* as training proceeds:
+//
+//   T0  mate-in-1            — guaranteed decisive: MCTS sees the mating child
+//                              immediately, so even an untrained net earns z = ±1.
+//   T1  mate-in-2            — a short forced mate; needs a few plies of search.
+//   T2  winning material     — KQ/KR/KRR vs lone king; decisive but requires real
+//                              conversion technique (no <=2 forced mate), so it
+//                              only yields decisive games once the net has some skill.
+//   T3  standard opening     — the AlphaZero target distribution.
+//
+// Each game samples a tier from an episode-dependent distribution (a blend, not a
+// hard switch), so the easy tiers fade gradually and the full opening grows in.
+// A small permanent floor of forced mates remains forever as cheap insurance
+// against value-head collapse late in training (set the last row to {0,0,0,1} for
+// pure self-play once the net reliably produces its own decisive games).
+//
+// NOTE: every FEN below is a VERIFIED forced mate (minimax solver) / decisive
+// position — see tools/gen_curriculum.py. The previous curriculum (a) was only 5
+// episodes long, (b) leaned on K+2Q-vs-k positions a weak net just shuffles into a
+// 50-move draw (z = 0, defeating the curriculum's purpose), and (c) contained a
+// mislabeled "mate-in-1" that was not mate at all.
 
-static constexpr int CURRICULUM_EPISODES = 5;
-
-static const std::vector<std::string> CURRICULUM_FENS = {
-    // ── Mate-in-1 (White to move) ─────────────────────────────────────────────
-    "1k6/8/1KQ5/8/8/8/8/8 w - - 0 1",   // Kb6 + Qc6 vs kb8  →  Qc8#
-    "6k1/5Q2/6K1/8/8/8/8/8 w - - 0 1",  // Kg6 + Qf7 vs kg8  →  Qf8#
-    "k7/2Q5/2K5/8/8/8/8/8 w - - 0 1",   // Kc6 + Qc7 vs ka8  →  Qa7#
-    // ── Mate-in-1 (Black to move) ─────────────────────────────────────────────
-    "8/8/8/8/8/8/1q6/1k5K b - - 0 1",   // kb1 + qb2 vs Kh1  →  Qh2#
-    "K7/8/kq6/8/8/8/8/8 b - - 0 1",     // ka6 + qb6 vs Ka8  →  Qa7#
-    "8/8/8/8/8/1k6/2q5/K7 b - - 0 1",   // kb3 + qc2 vs Ka1  →  Qb2#
-    // ── K + 2 Queens vs lone king (White wins) ────────────────────────────────
-    "8/8/3k4/8/8/8/8/2QKQ3 w - - 0 1",
-    // ── K + 2 Rooks vs lone king (White wins) ────────────────────────────────
-    "8/8/3k4/8/8/8/8/2RKR3 w - - 0 1",
-    // ── K + Queen + Rook vs lone king (White wins) ────────────────────────────
-    "8/8/3k4/8/8/8/8/2QKR3 w - - 0 1",
-    // ── k + 2 queens vs lone King (Black wins) ────────────────────────────────
-    "3qkq2/8/8/4K3/8/8/8/8 b - - 0 1",
-    // ── k + 2 rooks vs lone King (Black wins) ────────────────────────────────
-    "3rkr2/8/8/4K3/8/8/8/8 b - - 0 1",
-    // ── k + queen + rook vs lone King (Black wins) ────────────────────────────
-    "3qkr2/8/8/4K3/8/8/8/8 b - - 0 1",
+// Tier 0 — verified mate-in-1 (color-balanced).
+static const std::vector<std::string> MATE_IN_1_FENS = {
+    "8/8/3k4/8/4Q3/8/2Q5/4K3 w - - 0 1",
+    "1q6/3K4/8/4q3/5k2/8/8/8 b - - 0 1",
+    "8/8/3K4/8/8/6Q1/7Q/2k5 w - - 0 1",
+    "1K6/8/q7/6q1/8/8/8/7k b - - 0 1",
+    "4K3/7Q/4k3/6Q1/8/8/8/8 w - - 0 1",
+    "K7/2q4q/8/8/8/k7/8/8 b - - 0 1",
+    "2R5/8/8/8/7R/k7/8/1K6 w - - 0 1",
+    "7K/8/8/8/8/8/5q1k/6q1 b - - 0 1",
 };
+
+// Tier 1 — verified mate-in-2 (color-balanced).
+static const std::vector<std::string> MATE_IN_2_FENS = {
+    "1R6/8/8/4Q3/1K6/8/8/1k6 w - - 0 1",
+    "2q5/1k5K/8/8/8/8/8/4r3 b - - 0 1",
+    "2k5/8/8/8/8/6Q1/4Q1K1/8 w - - 0 1",
+    "8/8/8/8/4K3/8/4k3/2q1q3 b - - 0 1",
+    "1k6/8/4R3/8/3Q4/5K2/8/8 w - - 0 1",
+    "8/5K2/8/1q6/3k4/8/8/7q b - - 0 1",
+    "7k/6R1/8/8/4R3/3K4/8/8 w - - 0 1",
+    "8/8/8/5r2/8/1qk5/8/7K b - - 0 1",
+};
+
+// Tier 2 — verified decisive material, NOT a <=2 forced mate (needs conversion).
+static const std::vector<std::string> WINNING_MATERIAL_FENS = {
+    "4K3/8/8/8/1k6/8/8/R7 w - - 0 1",
+    "8/8/6k1/8/K7/8/5r2/8 b - - 0 1",
+    "1R6/8/8/6k1/8/8/7K/8 w - - 0 1",
+    "8/6r1/8/4k3/1K6/8/8/r7 b - - 0 1",
+    "8/8/8/5k2/3R3K/8/8/R7 w - - 0 1",
+    "6k1/8/2q5/8/1K6/8/8/8 b - - 0 1",
+};
+
+// Episode-indexed tier-sampling weights: {mate-in-1, mate-in-2, material, opening}.
+// The first row whose max_episode >= episode applies.
+struct CurriculumStage {
+    int                   max_episode;
+    std::array<double, 4> weights;
+};
+static const std::vector<CurriculumStage> CURRICULUM_SCHEDULE = {
+    {  10, {0.55, 0.30, 0.15, 0.00}},   // bootstrap: almost all guaranteed-decisive
+    {  25, {0.30, 0.30, 0.25, 0.15}},
+    {  50, {0.15, 0.20, 0.25, 0.40}},
+    { 100, {0.07, 0.10, 0.13, 0.70}},
+    {1 << 30, {0.01, 0.02, 0.02, 0.95}},// steady state: ~5% decisive-signal floor
+};
+
+// Pick a starting board for the given episode using the curriculum schedule.
+static chess::Board select_curriculum_board(int episode, std::mt19937& rng) {
+    const std::array<double, 4>* w = &CURRICULUM_SCHEDULE.back().weights;
+    for (const auto& stage : CURRICULUM_SCHEDULE) {
+        if (episode <= stage.max_episode) { w = &stage.weights; break; }
+    }
+
+    std::discrete_distribution<int> tier_dist(w->begin(), w->end());
+    const int tier = tier_dist(rng);
+
+    const std::vector<std::string>* pool = nullptr;
+    switch (tier) {
+        case 0: pool = &MATE_IN_1_FENS;        break;
+        case 1: pool = &MATE_IN_2_FENS;        break;
+        case 2: pool = &WINNING_MATERIAL_FENS; break;
+        default: return chess::Board();        // tier 3 — standard start position
+    }
+    std::uniform_int_distribution<int> fen_dist(0, static_cast<int>(pool->size()) - 1);
+    return chess::Board((*pool)[fen_dist(rng)]);
+}
 
 ParallelSelfPlay::ParallelSelfPlay(const ParallelSelfPlayConfig& cfg)
     : cfg_(cfg)
@@ -179,13 +242,9 @@ ParallelSelfPlay::play_game(AsyncMCTS& mcts, float temperature,
                              float dirichlet_alpha, float dirichlet_epsilon) {
     static thread_local std::mt19937 rng(std::random_device{}());
 
-    // Select starting position: curriculum FENs for early episodes, normal start after.
-    chess::Board board;
-    if (cfg_.episode <= CURRICULUM_EPISODES) {
-        std::uniform_int_distribution<int> fen_dist(
-            0, static_cast<int>(CURRICULUM_FENS.size()) - 1);
-        board = chess::Board(CURRICULUM_FENS[fen_dist(rng)]);
-    }
+    // Select starting position via the curriculum schedule (Tier 1 difficulty ramp):
+    // forced-mate / decisive positions early, blending toward the standard opening.
+    chess::Board board = select_curriculum_board(cfg_.episode, rng);
 
     struct TrajEntry {
         std::array<float, STATE_CHANNELS * BOARD_SZ * BOARD_SZ> state;
