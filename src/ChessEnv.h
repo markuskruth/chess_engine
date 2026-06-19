@@ -93,15 +93,4 @@ namespace ChessEnv {
     // Helper: is the game over?  Returns {is_over, is_checkmate}.
     std::pair<bool, bool> game_over(const chess::Board& board);
 
-    // Tapered evaluation from White's perspective, normalized to [-1, 1].
-    // Mirrors Python's ChessEnv.get_evaluation():
-    //   - Tapered material + PeSTO piece-square tables (mg/eg interpolated by phase)
-    //   - Bishop pair bonus
-    //   - Pawn structure: doubled, isolated, passed pawns
-    //   - Rook bonuses: open/half-open file, 7th rank
-    //   - King safety: open files near king, pawn shelter
-    //   - Symmetric mobility
-    // Returns the terminal reward for game-over positions.
-    float get_evaluation(const chess::Board& board);
-
 } // namespace ChessEnv

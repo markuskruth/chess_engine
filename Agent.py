@@ -282,15 +282,10 @@ class MCTS:
                  (result == "0-1" and current_color == chess.WHITE):
                 losses += 1
             elif result == "*":
-                pot = ChessEnv.get_evaluation(board)
-                if (pot > 0.5 and current_color == chess.WHITE) or \
-                   (pot < -0.5 and current_color == chess.BLACK):
-                    wins += 1
-                elif (pot < -0.5 and current_color == chess.WHITE) or \
-                     (pot > 0.5 and current_color == chess.BLACK):
-                    losses += 1
-                else:
-                    draws += 1
+                # Game still going at the move cap → scored as a draw.
+                # (No static eval to adjudicate with, and adjudicating with one
+                # model's own value head would bias a model-vs-model benchmark.)
+                draws += 1
             else:
                 draws += 1
 
@@ -330,16 +325,8 @@ class MCTS:
                  (result == "0-1" and model_color == chess.WHITE):
                 losses += 1
             elif result == "*":
-                # Move limit: use same threshold logic as training
-                pot = ChessEnv.get_evaluation(board)
-                if (pot > 0.5 and model_color == chess.WHITE) or \
-                   (pot < -0.5 and model_color == chess.BLACK):
-                    wins += 1
-                elif (pot < -0.5 and model_color == chess.WHITE) or \
-                     (pot > 0.5 and model_color == chess.BLACK):
-                    losses += 1
-                else:
-                    draws += 1
+                # Game still going at the move cap → scored as a draw (no static eval).
+                draws += 1
             else:
                 draws += 1
 

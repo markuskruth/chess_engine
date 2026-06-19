@@ -44,8 +44,7 @@ std::pair<std::vector<Sample>, std::vector<GameMeta>> SelfPlay::run() {
 //   - Terminal by checkmate: sideToMove is mated, so z = +1 if Black is mated
 //     (White wins), -1 if White is mated (Black wins), from White's perspective.
 //   - Terminal by draw rule:  z = 0.
-//   - Move limit hit:         z = ±1 if get_evaluation() > 0.3 (mirrors Python's
-//     threshold heuristic), z = 0 otherwise ("limit").
+//   - Move limit hit:         z = 0 ("limit") — recorded as a draw (no static eval).
 //
 // Per-ply value flip: each sample stores z from the perspective of the player
 // who moved at that ply (matching the flipped board encoding).
@@ -134,12 +133,10 @@ SelfPlay::play_game(float temperature) {
             outcome = "draw";
         }
     } else {
-        // Move limit reached — use heuristic evaluation as tiebreaker
-        // (mirrors Python's Agent.py play_game tiebreaker with threshold 0.3)
-        float pot = ChessEnv::get_evaluation(board);
-        if      (pot >  0.3f) { z =  1.0f; outcome = "white"; }
-        else if (pot < -0.3f) { z = -1.0f; outcome = "black"; }
-        // else z = 0.0f, outcome = "limit" (already set)
+        // Move limit reached — recorded as a draw (z = 0.0f, outcome "limit",
+        // already set above). The engine no longer ships a static evaluation to
+        // adjudicate with, and the value target stays pure (game outcomes only).
+        // Matches ParallelSelfPlay (the training path).
     }
 
     // Build samples. z is flipped to be mover-relative. The auxiliary slot now holds

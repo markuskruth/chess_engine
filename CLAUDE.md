@@ -31,18 +31,18 @@ model → C++ plays self-play games → Python loads the data and trains → rep
 |------|------|
 | [main.py](main.py) | **Two purposes.** (1) The `run_training_parallel_hybrid()` training loop (the active `__main__` block at the bottom). (2) A standalone **PySide6 GUI** (`MainWindow`, `AIWorker`, board widget, eval bar) for a human to play the trained model. |
 | [Agent.py](Agent.py) | Core Python **MCTS + Node** classes, the `MCTS.train_network()` gradient step, `evaluate_vs_model()` / `evaluate_vs_random()` benchmarking, the hybrid training orchestration, replay-window/aux-loss schedules, and `run_benchmark()`. This is the heart of the Python side. |
-| [ChessEnv.py](ChessEnv.py) | **Reference chess environment.** State encoding (`encode_state` → 20×8×8), action decoding (`apply_action`), legal-move mask (`get_action_mask`), and a hand-written tapered **PeSTO evaluation** (`get_evaluation`). The C++ `ChessEnv` must match this byte-for-byte. |
+| [ChessEnv.py](ChessEnv.py) | **Reference chess environment.** State encoding (`encode_state` → 20×8×8), action decoding (`apply_action`), legal-move mask (`get_action_mask`). The C++ `ChessEnv` must match these byte-for-byte. (The old hand-written PeSTO `get_evaluation`/`get_reward` have been **removed** — the engine no longer ships a static eval.) |
 | [Neuralnet.py](Neuralnet.py) | `CNNNet`: initial conv + 10 residual blocks (128 channels) → **three heads**: policy (4672), **value = WDL** (3 logits `[win, draw, loss]`, mover-relative, no activation), and a **moves-left** head (softplus scalar — normalized plies to game end). |
 | [utils.py](utils.py) | `PrioritizedReplayBuffer` (PER) backed by a binary `_SumTree`. Sparse policy storage, dynamic capacity `grow()`, beta annealing, tree snapshot/restore for checkpointing. |
 | [data_loader.py](data_loader.py) | `load_binary_game_data()` — reads the C++ self-play `.bin` file into numpy arrays for the replay buffer. **Defines the binary format contract.** |
-| [MCTS_simple.py](MCTS_simple.py) | Standalone classical MCTS (UCB + random rollouts, no NN). Reference / baseline only; not part of the training pipeline. Note: it calls `ChessEnv.get_potential()` which no longer exists (`get_evaluation` is the current name) — treat as stale. |
+| [MCTS_simple.py](MCTS_simple.py) | Standalone classical MCTS (UCB + random rollouts, no NN). Reference / baseline only; not part of the training pipeline. Note: it calls `ChessEnv.get_potential()` (and assumes a static board evaluation) which no longer exists — the PeSTO eval was removed — so treat it as fully stale. |
 
 ### C++ (`src/`, parallel self-play engine)
 
 | File | Role |
 |------|------|
 | [src/main.cpp](src/main.cpp) | CLI entry point for the `selfplay` binary. Parses args, picks sequential `SelfPlay` (`--workers 1`) or `ParallelSelfPlay` (`--workers > 1`), runs games, writes binary data. |
-| [src/ChessEnv.h](src/ChessEnv.h) / [src/ChessEnv.cpp](src/ChessEnv.cpp) | **C++ mirror of ChessEnv.py** — must produce identical `encode_state`, `get_action_mask`, `apply_action`, and `get_evaluation` outputs. Uses the Disservin chess-library. |
+| [src/ChessEnv.h](src/ChessEnv.h) / [src/ChessEnv.cpp](src/ChessEnv.cpp) | **C++ mirror of ChessEnv.py** — must produce identical `encode_state`, `get_action_mask`, and `apply_action` outputs. Also defines `game_over()` and the shared `wdl_logits_to_value()` helper. Uses the Disservin chess-library. |
 | [src/MCTS.h](src/MCTS.h) / [src/MCTS.cpp](src/MCTS.cpp) | Synchronous batched MCTS (`Node`, virtual loss, `run_simulation_batch`). Used by the single-threaded `SelfPlay` path. |
 | [src/SelfPlay.h](src/SelfPlay.h) / [src/SelfPlay.cpp](src/SelfPlay.cpp) | Sequential self-play loop + `write_data()` (the canonical binary serializer). Defines `Sample`, `GameMeta`, `SelfPlayConfig`. |
 | [src/Evaluator.h](src/Evaluator.h) | `EvalQueue` — thread-safe MPSC queue of leaf eval requests with a careful shutdown protocol (worker-done counting + partial-batch flush to avoid deadlock). |
@@ -94,9 +94,10 @@ historical build-order context, not a runtime concept.
 - **Auxiliary head predicts moves-left** (plies to game end, normalized ÷
   `_MOVES_LEFT_SCALE`=100), with a small *constant* weight `_MOVES_LEFT_WEIGHT`
   (0.15) — **not** annealed. It is a training-only regularizer and does **not** (yet)
-  influence search/move selection. `get_evaluation` (PeSTO) is **no longer used in
-  the training data path** — only the sequential `SelfPlay` move-limit tiebreak and
-  the GUI eval bar still call it (so its known asymmetry bugs no longer affect training).
+  influence search/move selection. The hand-written PeSTO `get_evaluation` has been
+  **removed entirely** — value targets are pure game outcomes, non-decisive/move-limit
+  games score as draws (`z=0`) in both self-play paths, and benchmarks/the GUI eval bar
+  use the model's own WDL output instead of a static eval.
 
 ## Build & run
 
